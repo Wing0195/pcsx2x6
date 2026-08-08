@@ -130,6 +130,7 @@ namespace usb_lightgun
 		// Configuration
 		//////////////////////////////////////////////////////////////////////////
 		bool has_relative_binds = false;
+		u32 pointer_index = 0; // host pointer slot for mouse aim (per-device with Raw Input)
 		bool custom_config = false;
 		u32 screen_width = 640;
 		u32 screen_height = 240;
@@ -166,6 +167,7 @@ namespace usb_lightgun
 
 		// 0..1, not -1..1.
 		std::pair<float, float> GetAbsolutePositionFromRelativeAxes() const;
+		u32 EffectivePointerIndex() const;
 		u32 GetSoftwarePointerIndex() const;
 		void UpdateSoftwarePointerPosition();
 	};
@@ -274,7 +276,7 @@ namespace usb_lightgun
 					// TODO: use CalculatePosition() result instead of raw mouse, so Relative Aiming (joystick) works for S246
 					if (ACJV::enabled)
 					{
-						const auto& [mx, my] = InputManager::GetPointerAbsolutePosition(0);
+						const auto& [mx, my] = InputManager::GetPointerAbsolutePosition(us->EffectivePointerIndex());
 						float dx, dy;
 						GSTranslateWindowToDisplayCoordinates(mx, my, &dx, &dy);
 						bool on_screen = (dx >= 0.0f && dy >= 0.0f);
@@ -387,7 +389,7 @@ namespace usb_lightgun
 	{
 		float pointer_x, pointer_y;
 		const auto& [window_x, window_y] =
-			(has_relative_binds) ? GetAbsolutePositionFromRelativeAxes() : InputManager::GetPointerAbsolutePosition(0);
+			(has_relative_binds) ? GetAbsolutePositionFromRelativeAxes() : InputManager::GetPointerAbsolutePosition(EffectivePointerIndex());
 		GSTranslateWindowToDisplayCoordinates(window_x, window_y, &pointer_x, &pointer_y);
 
 		s16 pos_x, pos_y;
@@ -439,9 +441,14 @@ namespace usb_lightgun
 			screen_rel_x * ImGuiManager::GetWindowWidth(), screen_rel_y * ImGuiManager::GetWindowHeight());
 	}
 
+	u32 GunCon2State::EffectivePointerIndex() const
+	{
+		return InputManager::IsUsingRawInput() ? pointer_index : 0;
+	}
+
 	u32 GunCon2State::GetSoftwarePointerIndex() const
 	{
-		return has_relative_binds ? (InputManager::MAX_POINTER_DEVICES + port) : 0;
+		return has_relative_binds ? (InputManager::MAX_POINTER_DEVICES + port) : EffectivePointerIndex();
 	}
 
 	void GunCon2State::UpdateSoftwarePointerPosition()
@@ -503,8 +510,19 @@ namespace usb_lightgun
 	{
 		const auto& [wx, wy] = s->GetAbsolutePositionFromRelativeAxes();
 		float dx, dy;
-		GSTranslateWindowToDisplayCoordinates(wx, wy, &dx, &dy);
+		GSTranslateWindowToDisplayCoordinatesUnclamped(wx, wy, &dx, &dy);
 		ACJV::SetGunRelativeAim(s->port, dx, dy);
+	}
+
+	static u32 PointerIndexFromBinding(const std::string& binding)
+	{
+		if (StringUtil::StartsWithNoCase(binding, "Pointer-"))
+		{
+			const std::optional<u32> idx = StringUtil::FromChars<u32>(std::string_view(binding).substr(8));
+			if (idx.has_value() && idx.value() < InputManager::MAX_POINTER_DEVICES)
+				return idx.value();
+		}
+		return 0;
 	}
 
 	void GunCon2Device::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
@@ -541,16 +559,18 @@ namespace usb_lightgun
 
 		const s32 prev_pointer_index = s->GetSoftwarePointerIndex();
 
-		s->has_relative_binds = (USB::ConfigKeyExists(si, s->port, TypeName(), "RelativeLeft") ||
-			USB::ConfigKeyExists(si, s->port, TypeName(), "RelativeRight") ||
-			USB::ConfigKeyExists(si, s->port, TypeName(), "RelativeUp") ||
-			USB::ConfigKeyExists(si, s->port, TypeName(), "RelativeDown"));
+		s->has_relative_binds = (!USB::GetConfigString(si, s->port, TypeName(), "RelativeLeft").empty() ||
+			!USB::GetConfigString(si, s->port, TypeName(), "RelativeRight").empty() ||
+			!USB::GetConfigString(si, s->port, TypeName(), "RelativeUp").empty() ||
+			!USB::GetConfigString(si, s->port, TypeName(), "RelativeDown").empty()); // empty/cleared binds must not latch relative aim
 
 		// Arcade aim goes through ACJV; the Aim Device is either the mouse (Pointer-N) or a controller stick.
 		const bool joystick_aim = !pointer_binding.empty() && !StringUtil::StartsWithNoCase(pointer_binding, "Pointer-");
 		ACJV::SetGunAimSource(s->port, joystick_aim);
 		if (joystick_aim)
 			ForwardRelativeAimToJVS(s);
+		s->pointer_index = PointerIndexFromBinding(pointer_binding);
+		ACJV::SetGunPointerIndex(s->port, s->pointer_index);
 
 		const s32 new_pointer_index = s->GetSoftwarePointerIndex();
 
@@ -560,12 +580,20 @@ namespace usb_lightgun
 				s->cursor_scale != cursor_scale ||
 				s->cursor_color != cursor_color);
 
+		const u32 other_port = s->port ^ 1u;
+		const std::string other_binding = USB::GetConfigString(si, other_port, TypeName(), "Pointer");
+		const bool other_aims_mouse = USB::GetConfigDevice(si, other_port) == TypeName() &&
+			StringUtil::StartsWithNoCase(other_binding, "Pointer-") &&
+			!USB::GetConfigString(si, other_port, TypeName(), "cursor_path").empty();
+		const s32 other_slot = static_cast<s32>(InputManager::IsUsingRawInput() ? PointerIndexFromBinding(other_binding) : 0u);
+		const bool other_shares_slot = other_aims_mouse && other_slot == new_pointer_index;
+
 		if (cursor_changed)
 		{
-			// Only clear a gun's own dedicated slot; slot 0 is the shared mouse pointer (another player/gun
-			// may be aiming with it), so switching this gun off it must not yank slot 0 out from under them.
-			if (prev_pointer_index != new_pointer_index && prev_pointer_index >= static_cast<s32>(InputManager::MAX_POINTER_DEVICES))
-				ImGuiManager::ClearSoftwareCursor(prev_pointer_index);
+			if (prev_pointer_index != new_pointer_index &&
+				(prev_pointer_index >= static_cast<s32>(InputManager::MAX_POINTER_DEVICES) ||
+					!(other_aims_mouse && other_slot == prev_pointer_index)))
+				ImGuiManager::ClearSoftwareCursor(prev_pointer_index); // keep the slot only while the other gun still aims with it
 
 			const bool had_software_cursor = !s->cursor_path.empty();
 
@@ -583,7 +611,8 @@ namespace usb_lightgun
 		// Always re-assert the configured cursor.
 		// ImGui cursor state can be cleared during VM/device shutdown even when
 		// GunCon2 settings did not change between games.
-		if (!s->cursor_path.empty())
+		// Skip while a lower port owns the shared cursor slot, so its freshly changed scale survives.
+		if (!s->cursor_path.empty() && !(other_shares_slot && s->port != 0 && !s->has_relative_binds))
 		{
 			ImGuiManager::SetSoftwareCursor(new_pointer_index, s->cursor_path, s->cursor_scale, s->cursor_color);
 			s->UpdateSoftwarePointerPosition();
@@ -630,8 +659,14 @@ namespace usb_lightgun
 						ACJV::SetButtonState(player, mapping.p1_trigger, pressed);
 					break;
 				}
-				// Foot pedal (cover/reload system: TC3, TC4, Cobra)
-				case BID_A:       ACJV::SetButtonState(player, ACJV::GetGunMapping().pedal, pressed); break;
+				// Foot pedal (cover/reload system: TC3, TC4, Cobra). Vampire Night has no pedal
+				// switch, so there the bind forces the camera-lost report = a manual reload.
+				case BID_A:
+					if (ACJV::GetGunMapping().board == GunBoardModel::CameraVN)
+						ACJV::SetGunForceOffscreen(pressed);
+					else
+						ACJV::SetButtonState(player, ACJV::GetGunMapping().pedal, pressed);
+					break;
 				// Start: P1 uses p1_start, P2 uses p2_start if defined (Vampire Night 2P)
 				case BID_START:
 				{

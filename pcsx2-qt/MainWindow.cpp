@@ -61,6 +61,8 @@
 
 #ifdef _WIN32
 #include "common/RedtapeWindows.h"
+#include "pcsx2/Input/InputSource.h"
+#include "pcsx2/Input/RawInputSource.h"
 #include <Dbt.h>
 #endif
 
@@ -403,6 +405,10 @@ void MainWindow::connectSignals()
 #endif
 	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnableEEConsoleLogging, "Logging", "EnableEEConsole", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnableIOPConsoleLogging, "Logging", "EnableIOPConsole", false);
+	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnable_ACATA_Read_Logging, "Arcade",  "ATAVerboseReads", false);
+	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnable_SRAM_Access_Logging, "Arcade", "SRAMVerboseReads", false);
+	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnable_RAM_Access_Logging, "Arcade",  "RAMVerboseReads", false);
+	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnable_UART_Access_Logging, "Arcade",  "UARTVerbose", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnableLogWindow, "Logging", "EnableLogWindow", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnableFileLogging, "Logging", "EnableFileLogging", true);
 	SettingWidgetBinder::BindWidgetToBoolSetting(nullptr, m_ui.actionEnableLogTimestamps, "Logging", "EnableTimestamps", true);
@@ -2492,6 +2498,18 @@ bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr
 				if (GetRawInputData((HRAWINPUT)msg->lParam, RID_INPUT, lpb.data(), &dwSize, sizeof(RAWINPUTHEADER)) == dwSize)
 				{
 					const RAWINPUT* raw = reinterpret_cast<const RAWINPUT*>(lpb.data());
+
+					// dispatch to RawInputSource for per-device tracking
+					InputSource* raw_source = InputManager::GetInputSourceInterface(InputSourceType::RawInput);
+					if (raw_source && raw_source->IsInitialized())
+					{
+						HWND render_hwnd = m_display_surface ?
+							reinterpret_cast<HWND>(m_display_surface->winId()) : static_cast<HWND>(nullptr);
+						pxAssertMsg(dynamic_cast<RawInputSource*>(raw_source), "Expected RawInputSource");
+						static_cast<RawInputSource*>(raw_source)->ProcessRawInput(raw, render_hwnd);
+					}
+
+					// system-cursor lock/clamp, always active
 					if (raw->header.dwType == RIM_TYPEMOUSE)
 					{
 						const RAWMOUSE& mouse = raw->data.mouse;
@@ -2954,13 +2972,17 @@ void MainWindow::doGameSettings(const char* category)
 	// prefer to use a game list entry, if we have one, that way the summary is populated
 	if (!s_current_disc_path.isEmpty() || !s_current_elf_override.isEmpty())
 	{
+		// Arcade boots through proverb.elf, so the path lookup would find that ELF instead of the game.
+		const bool arcade = s_current_disc_crc == 0 && !s_current_disc_serial.isEmpty() && !s_current_elf_override.isEmpty();
 		const QString& path = (s_current_elf_override.isEmpty() ? s_current_disc_path : s_current_elf_override);
 
 		std::optional<GameList::Entry> entry;
 
 		{
 			auto lock = GameList::GetLock();
-			const GameList::Entry* entry_ptr = GameList::GetEntryForPath(path.toUtf8().constData());
+			const GameList::Entry* entry_ptr = arcade ?
+				GameList::GetEntryBySerialAndCRC(s_current_disc_serial.toStdString(), s_current_disc_crc) :
+				GameList::GetEntryForPath(path.toUtf8().constData());
 			if (entry_ptr)
 				entry = *entry_ptr;
 		}
@@ -2968,29 +2990,22 @@ void MainWindow::doGameSettings(const char* category)
 		if (entry.has_value())
 		{
 			SettingsWindow::openGamePropertiesDialog(
-				&*entry, entry->title, entry->serial, entry->crc, !s_current_elf_override.isEmpty(), category);
+				&*entry, entry->title, entry->serial, entry->crc, entry->type == GameList::EntryType::ELF, category);
 			return;
 		}
 	}
 
-	// open properties for the current running file (isn't in the game list)
-	if (s_current_disc_crc == 0)
+	// open properties for the current running file (isn't in the game list).
+	// Arcade has an elf override (proverb.elf) but a valid serial (NMxxxxx) at crc 0, so key by it.
+	if (s_current_disc_crc == 0 && s_current_disc_serial.isEmpty())
 	{
 		QMessageBox::critical(this, tr("Game Properties"), tr("Game properties is unavailable for the current game."));
 		return;
 	}
 
-	// can't use serial for ELFs, because they might have a disc set
-	if (s_current_elf_override.isEmpty())
-	{
-		SettingsWindow::openGamePropertiesDialog(
-			nullptr, s_current_title.toStdString(), s_current_disc_serial.toStdString(), s_current_disc_crc, false, category);
-	}
-	else
-	{
-		SettingsWindow::openGamePropertiesDialog(
-			nullptr, s_current_title.toStdString(), std::string(), s_current_disc_crc, true, category);
-	}
+	SettingsWindow::openGamePropertiesDialog(
+		nullptr, s_current_title.toStdString(), s_current_disc_serial.toStdString(), s_current_disc_crc,
+		!s_current_elf_override.isEmpty() && s_current_disc_serial.isEmpty(), category);
 }
 
 void MainWindow::openDebugger()
@@ -3190,7 +3205,7 @@ void MainWindow::clearGameListEntryPlayTime(const GameList::Entry& entry, const 
 
 void MainWindow::goToWikiPage(const GameList::Entry& entry)
 {
-	QtUtils::OpenURL(this, fmt::format("https://wiki.pcsx2.net/{}", entry.serial).c_str());
+	QtUtils::OpenURL(this, fmt::format("https://ps2homebrew-arcade.github.io/pcsx2x6/games/{}", entry.serial).c_str());
 }
 
 void MainWindow::openSnapshotsFolderForGame(const GameList::Entry& entry)

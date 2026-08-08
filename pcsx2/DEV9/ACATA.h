@@ -6,6 +6,7 @@
  * used by ACATA.IRX, which is used by ACDVDV and ACATAD for using disc readers or hard drives on system2x6 units
  */
 
+#include "Config.h"
 #include "MemoryTypes.h"
 #include "common/Pcsx2Types.h"
 #include "common/Pcsx2Defs.h"
@@ -23,6 +24,8 @@
 
 #include "ACATA_internal.h"
 #include "ACATAPI.h"
+
+#define ACATA_LOG(fmt, ...) if (EmuConfig.Arcade.ATAVerboseReads) Console.WriteLn(Color_Gray, "ACATA:" fmt __VA_OPT__(,) __VA_ARGS__)
 
 #define ACATA_R_DATA                0x16000000  // Read/Write PIO data bytes
 #define ACATA_R_FEATURE             0x16010000  // [W] Used to control command specific interface features.
@@ -83,6 +86,9 @@ namespace ACATA
         extern FILE* IMAGE;
         extern s64 IMAGESIZE;
         extern u32 sectorsize; //512 for hdd and 2048 for Disc (?) check it
+        extern u32 unitbytes;   //bytes per sector unit in a raw disc image file (0 = plain 2048-byte units)
+        extern u32 unitdataoff; //offset of the 2048-byte payload inside a unit
+        extern std::string open_error; //user-facing reason when IO_OpenImage rejects the image
         extern u32 nsector;
         extern s64 LBA;
 

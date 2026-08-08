@@ -5,6 +5,11 @@
 #include "ImGui/ImGuiManager.h"
 #include "Input/InputManager.h"
 #include "Input/InputSource.h"
+#ifdef _WIN32
+#include "Input/RawInputSource.h"
+#elif defined(__linux__)
+#include "Input/EvdevInputSource.h"
+#endif
 #include "SIO/Pad/Pad.h"
 #include "SIO/Sio.h"
 #include "USB/USB.h"
@@ -173,6 +178,7 @@ static std::array<float, 2> s_pointer_axis_dead_zone;
 static std::array<float, 2> s_pointer_axis_range;
 static std::array<float, 2> s_pointer_pos = {0.0f, 0.0f};
 static float s_pointer_inertia = 0.0f;
+static std::array<u32, InputManager::MAX_POINTER_DEVICES> s_pointer_button_state = {};
 
 using PointerMoveCallback = std::function<void(InputBindingKey key, float value)>;
 using KeyboardEventCallback = std::function<void(InputBindingKey key, float value)>;
@@ -701,6 +707,9 @@ static std::array<const char*, static_cast<u32>(InputSourceType::Count)> s_input
 #ifdef _WIN32
 	"DInput",
 	"XInput",
+	"RawInput",
+#elif defined(__linux__)
+	"Evdev",
 #endif
 }};
 
@@ -728,6 +737,9 @@ bool InputManager::GetInputSourceDefaultEnabled(InputSourceType type)
 			return false;
 
 		case InputSourceType::XInput:
+			return false;
+
+		case InputSourceType::RawInput:
 			return false;
 #endif
 
@@ -882,6 +894,8 @@ void InputManager::AddJVSBindings(SettingsInterface& si, bool is_profile)
 		}}, InputBindingInfo::Type::Button, si, ACJV::CONFIG_SECTION, bi.name, is_profile);
 	}
 
+	ACJV::SetGunOffscreenContour(si.GetFloatValue(ACJV::CONFIG_SECTION, "GunOffscreenContour", 1.0f) / 100.0f);
+
 	const std::span<const InputBindingInfo> player_bindings[] = {
 		ACJV::GetButtonBindings(),
 		ACJV::GetP2ButtonBindings(),
@@ -1010,6 +1024,38 @@ void InputManager::AddJVSBindings(SettingsInterface& si, bool is_profile)
 		AddBindings(bindings, InputAxisEventHandler{[channel = static_cast<u32>(bi.bind_index)](InputBindingKey key, float value) {
 			ACJV::SetDrumHit(channel, value > 0.5f);
 		}}, bi.bind_type, si, ACJV::CONFIG_SECTION, bi.name, is_profile);
+	}
+
+	// Touch panel: press bind + relative-aim axes + crosshair
+	{
+		const std::vector<std::string> press(si.GetStringList(ACJV::CONFIG_SECTION, "TouchPress"));
+		ACJV::SetTouchPressBound(!press.empty());
+		if (!press.empty())
+		{
+			AddBindings(press, InputAxisEventHandler{[](InputBindingKey, float value) {
+				ACJV::SetTouchPressed(value > 0.5f);
+			}}, InputBindingInfo::Type::Button, si, ACJV::CONFIG_SECTION, "TouchPress", is_profile);
+		}
+
+		static constexpr const char* touch_axes[] = {"TouchRelativeLeft", "TouchRelativeRight", "TouchRelativeUp", "TouchRelativeDown"};
+		bool any_relative = false;
+		for (u32 i = 0; i < std::size(touch_axes); i++)
+		{
+			const std::vector<std::string> axis(si.GetStringList(ACJV::CONFIG_SECTION, touch_axes[i]));
+			if (axis.empty())
+				continue;
+			any_relative = true;
+			AddBindings(axis, InputAxisEventHandler{[i](InputBindingKey, float value) {
+				ACJV::SetTouchRelativeAxis(i, value);
+			}}, InputBindingInfo::Type::HalfAxis, si, ACJV::CONFIG_SECTION, touch_axes[i], is_profile);
+		}
+		ACJV::SetTouchRelativeActive(any_relative);
+
+		const std::string color_str(si.GetStringValue(ACJV::CONFIG_SECTION, "TouchCursorColor", "#ffffff"));
+		const u32 color = color_str.empty() ? 0xFFFFFFu :
+			static_cast<u32>(std::strtoul(color_str.c_str() + (color_str[0] == '#' ? 1 : 0), nullptr, 16));
+		ACJV::SetTouchCursor(si.GetStringValue(ACJV::CONFIG_SECTION, "TouchCursorPath", ""),
+			si.GetFloatValue(ACJV::CONFIG_SECTION, "TouchCursorScale", 1.0f), color);
 	}
 }
 
@@ -1220,6 +1266,20 @@ bool InputManager::IsAxisHandler(const InputEventHandler& handler)
 
 bool InputManager::InvokeEvents(InputBindingKey key, float value, GenericInputBinding generic_key)
 {
+	// When RawInput is active, suppress all Pointer button events.
+	// These are duplicates of the per-device RawMouse events from the lightgun.
+	if (key.source_type == InputSourceType::Pointer && key.source_subtype == InputSubclass::PointerButton && IsUsingRawInput())
+		return false;
+
+	if (key.source_type == InputSourceType::Pointer && key.source_subtype == InputSubclass::PointerButton &&
+		key.source_index < MAX_POINTER_DEVICES && key.data < 32)
+	{
+		if (value > 0.0f)
+			s_pointer_button_state[key.source_index] |= (1u << key.data);
+		else
+			s_pointer_button_state[key.source_index] &= ~(1u << key.data);
+	}
+
 	if (DoEventHook(key, value))
 		return true;
 
@@ -1483,10 +1543,66 @@ void InputManager::GenerateRelativeMouseEvents()
 	}
 }
 
+#ifdef _WIN32
+static RawInputSource* GetActiveRawInputSource()
+{
+	InputSource* source = InputManager::GetInputSourceInterface(InputSourceType::RawInput);
+	return (source && source->IsInitialized()) ? static_cast<RawInputSource*>(source) : nullptr;
+}
+#elif defined(__linux__)
+static EvdevInputSource* GetActiveEvdevSource()
+{
+	InputSource* source = InputManager::GetInputSourceInterface(InputSourceType::Evdev);
+	return (source && source->IsInitialized()) ? static_cast<EvdevInputSource*>(source) : nullptr;
+}
+#endif
+
+bool InputManager::IsUsingRawInput()
+{
+#ifdef _WIN32
+	return GetActiveRawInputSource() != nullptr;
+#elif defined(__linux__)
+	return GetActiveEvdevSource() != nullptr;
+#else
+	return false;
+#endif
+}
+
+std::optional<u32> InputManager::GetPointerIndexForRawDevice(const std::string_view device_path)
+{
+#ifdef _WIN32
+	if (RawInputSource* source = GetActiveRawInputSource())
+		return source->GetPointerIndexForDevicePath(device_path);
+#elif defined(__linux__)
+	if (EvdevInputSource* source = GetActiveEvdevSource())
+		return source->GetPointerIndexForIdentity(device_path);
+#endif
+	return std::nullopt;
+}
+
+std::vector<std::pair<std::string, std::string>> InputManager::EnumerateRawPointerDevices()
+{
+#ifdef _WIN32
+	if (RawInputSource* source = GetActiveRawInputSource())
+		return source->GetRawMouseDeviceList();
+#elif defined(__linux__)
+	if (EvdevInputSource* source = GetActiveEvdevSource())
+		return source->GetPointerDeviceList();
+#endif
+	return {};
+}
+
 std::pair<float, float> InputManager::GetPointerAbsolutePosition(u32 index)
 {
 	return std::make_pair(s_host_pointer_positions[index][static_cast<u8>(InputPointerAxis::X)],
 		s_host_pointer_positions[index][static_cast<u8>(InputPointerAxis::Y)]);
+}
+
+bool InputManager::IsPointerButtonDown(u32 index, u32 button_index)
+{
+	if (index >= MAX_POINTER_DEVICES || button_index >= 32)
+		return false;
+	return (s_pointer_button_state[index] & (1u << button_index)) != 0;
 }
 
 void InputManager::UpdatePointerAbsolutePosition(u32 index, float x, float y)
@@ -1941,6 +2057,7 @@ void InputManager::UpdateInputSourceState(SettingsInterface& si, std::unique_loc
 #ifdef _WIN32
 #include "Input/DInputSource.h"
 #include "Input/XInputSource.h"
+#include "Input/RawInputSource.h"
 #endif
 
 void InputManager::ReloadSources(SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock)
@@ -1949,5 +2066,8 @@ void InputManager::ReloadSources(SettingsInterface& si, std::unique_lock<std::mu
 #ifdef _WIN32
 	UpdateInputSourceState<DInputSource>(si, settings_lock, InputSourceType::DInput);
 	UpdateInputSourceState<XInputSource>(si, settings_lock, InputSourceType::XInput);
+	UpdateInputSourceState<RawInputSource>(si, settings_lock, InputSourceType::RawInput);
+#elif defined(__linux__)
+	UpdateInputSourceState<EvdevInputSource>(si, settings_lock, InputSourceType::Evdev);
 #endif
 }

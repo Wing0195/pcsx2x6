@@ -176,6 +176,7 @@ static std::deque<std::thread> s_save_state_threads;
 static std::mutex s_save_state_threads_mutex;
 
 static std::recursive_mutex s_info_mutex;
+static std::string s_arcade_gameid;
 static std::string s_disc_serial;
 static std::string s_disc_elf;
 static std::string s_disc_version;
@@ -191,12 +192,12 @@ static bool s_elf_executed = false;
 static std::string s_elf_override;
 static std::string s_acgame;
 static std::string s_acgame_serial;
+std::string ArcadeiLinkID;
 static std::string s_input_profile_name;
 static u32 s_frame_advance_count = 0;
 static bool s_fast_boot_requested = false;
 static bool s_gs_open_on_initialize = false;
 static bool s_thread_affinities_set = false;
-static bool s_acgame_sys246 = false;
 static bool s_acgame_sys256 = false;
 
 static LimiterModeType s_limiter_mode = LimiterModeType::Nominal;
@@ -529,6 +530,7 @@ void VMManager::UpdateLoggingSettings(SettingsInterface& si)
 	TraceLogging.IOP.Memory.Enabled = true;
 	TraceLogging.SIF.Enabled = true;
 
+
 	// Input Recording Logs
 	ConsoleLogging.recordingConsole.Enabled = any_logging_sinks && si.GetBoolValue("Logging", "EnableInputRecordingLogs", true);
 	ConsoleLogging.controlInfo.Enabled = any_logging_sinks && si.GetBoolValue("Logging", "EnableControllerLogs", false);
@@ -554,6 +556,11 @@ void VMManager::SetDefaultLoggingSettings(SettingsInterface& si)
 	si.SetBoolValue("Logging", "EnableIOPConsole", false);
 	si.SetBoolValue("Logging", "EnableInputRecordingLogs", true);
 	si.SetBoolValue("Logging", "EnableControllerLogs", false);
+	
+	si.SetBoolValue("Arcade", "ATAVerboseReads", false);
+	si.SetBoolValue("Arcade", "SRAMVerboseReads", false);
+	si.SetBoolValue("Arcade", "RAMVerboseReads", false);
+	si.SetBoolValue("Arcade", "UARTVerbose", false);
 
 	EmuConfig.Trace.Enabled = false;
 	EmuConfig.Trace.EE.bitset = 0;
@@ -895,6 +902,11 @@ std::string VMManager::GetDebuggerSettingsFilePathForCurrentGame()
 	return GetDebuggerSettingsFilePath(s_disc_serial, s_current_crc);
 }
 
+static u32 GetCRCForPatches()
+{
+	return s_acgame.empty() ? s_current_crc : 0; // arcade: patches are keyed by the gameid alone
+}
+
 void VMManager::Internal::UpdateEmuFolders()
 {
 	const std::string old_cheats_directory(EmuFolders::Cheats);
@@ -910,7 +922,7 @@ void VMManager::Internal::UpdateEmuFolders()
 	if (VMManager::HasValidVM())
 	{
 		if (EmuFolders::Cheats != old_cheats_directory || EmuFolders::Patches != old_patches_directory)
-			Patch::ReloadPatches(s_disc_serial, s_current_crc, true, false, true, true);
+			Patch::ReloadPatches(s_disc_serial, GetCRCForPatches(), true, false, true, true);
 
 		if (EmuFolders::MemoryCards != old_memcards_directory)
 		{
@@ -1009,11 +1021,11 @@ std::string VMManager::GetSerialForGameSettings()
 bool VMManager::UpdateGameSettingsLayer()
 {
 	std::unique_ptr<INISettingsInterface> new_interface;
-	if (s_disc_crc != 0)
+	if (s_disc_crc != 0 || !s_acgame.empty()) // arcade: crc 0, keyed by the .acgame gameid
 	{
 		const std::string game_serial = GetSerialForGameSettings();
 		std::string filename(GetGameSettingsPath(game_serial, s_disc_crc));
-		if (!FileSystem::FileExists(filename.c_str()))
+		if (!FileSystem::FileExists(filename.c_str()) && s_acgame.empty()) // arcade: only {gameid}_0, no shared crc-only fallback
 		{
 			if (!game_serial.empty())
 				filename = GetGameSettingsPath(game_serial, 0);
@@ -1109,7 +1121,7 @@ void VMManager::UpdateDiscDetails(bool booting)
 			serial_is_valid = !s_disc_serial.empty();
 		}
 		else if (!s_acgame.empty()) {
-			//s_disc_serial = Path::GetFileTitle(s_acgame);
+			s_disc_serial = s_arcade_gameid;
 			title = s_title;
 			s_disc_version = {};
 			s_disc_crc = 0;
@@ -1131,6 +1143,10 @@ void VMManager::UpdateDiscDetails(bool booting)
 		// If we're booting an ELF, use its CRC, not the disc (if any).
 		if (!s_elf_override.empty())
 			s_disc_crc = cdvdGetElfCRC(s_elf_override);
+
+		// Arcade identity is crc 0 for every media (CD/DVD/HDD); the .acgame gameid is the serial.
+		if (!s_acgame.empty())
+			s_disc_crc = 0;
 
 		if (!booting && s_disc_serial == old_serial && s_disc_crc == old_crc)
 		{
@@ -1203,7 +1219,7 @@ void VMManager::UpdateDiscDetails(bool booting)
 	ApplySettings();
 
 	// Patches are game-dependent, thus should get applied after game settings ia loaded.
-	Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? s_current_crc : 0, true, true, false, false);
+	Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? GetCRCForPatches() : 0, true, true, false, false);
 
 	ReportGameChangeToHost();
 	if (MTGS::IsOpen())
@@ -1240,7 +1256,7 @@ void VMManager::HandleELFChange(bool verbose_patches_if_changed)
 	Achievements::GameChanged(s_disc_crc, crc_to_report);
 
 	Console.WriteLn(Color_StrongOrange, fmt::format("ELF changed, active CRC {:08X} ({})", crc_to_report, s_elf_path));
-	Patch::ReloadPatches(s_disc_serial, crc_to_report, false, false, false, verbose_patches_if_changed);
+	Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? GetCRCForPatches() : 0, false, false, false, verbose_patches_if_changed);
 	ApplyCoreSettings();
 }
 
@@ -1336,16 +1352,8 @@ bool VMManager::AutoDetectSource(const std::string& filename, Error* error)
 				return false;
 			} else {
 				Console.WriteLn(Color_Green, "# ARCADE GAME CONFIG FILE DETECTED");
-				std::string basedir = Path::ToNativePath(Path::GetDirectory(filename))+FS_OSPATH_SEPARATOR_CHARACTER;
-				std::string subdir = INI.GetStringValue("data", "subdir");
-				if (subdir != "") basedir = Path::AppendDirectory(basedir, subdir);
-				Console.WriteLnFmt(Color_Green, "ACGAME: basedir:'{}'", basedir);
 				std::string s_acmedia, s_imgname, s_serial;
-				s_acmedia = INI.GetStringValue("data", "media");
-				s_imgname = INI.GetStringValue("data", "mediasrc");
-				s_title = s_serial = INI.GetStringValue("game", "name");
-				s_disc_serial = s_serial = INI.GetStringValue("game", "gameid");
-				s_acgame_serial = s_serial;
+				s_acgame_serial = s_arcade_gameid = s_disc_serial = s_serial = INI.GetStringValue("game", "gameid");
 				bool idvalid = (s_serial.length() == 7 && (s_serial[0] == 'N' && s_serial[1] == 'M'));
     			for (int i = 2; idvalid && i < 7; i++)
     			    idvalid = (s_serial[i] >= '0' && s_serial[i] <= '9');
@@ -1354,18 +1362,60 @@ bool VMManager::AutoDetectSource(const std::string& filename, Error* error)
 					return false;
 				}
 
+				std::string basedir = Path::ToNativePath(Path::GetDirectory(filename))+FS_OSPATH_SEPARATOR_CHARACTER;
+				std::string subdir = INI.GetStringValue("data", "subdir", s_serial.c_str());
+				if (subdir != "") basedir = Path::AppendDirectory(basedir, subdir);
+				Console.WriteLnFmt(Color_Green, "ACGAME: basedir:'{}'", basedir);
+				s_acmedia = INI.GetStringValue("data", "media");
+				s_imgname = INI.GetStringValue("data", "mediasrc", fmt::format("{}.chd", s_serial).c_str());
+				ArcadeiLinkID = INI.GetStringValue("data", "256Region", "");
+				if (!ArcadeiLinkID.empty()) {
+					if (ArcadeiLinkID != "ASIA4" && ArcadeiLinkID != "ASIA5" && ArcadeiLinkID != "JAPAN") {
+						Error::SetStringFmt(error, "Invalid SYSTEM256 regional signature override! '{}'", ArcadeiLinkID);
+						return false;
+					} else
+						Console.WriteLnFmt(Color_Green, "system256 Region: changing iLinkID to {}", ArcadeiLinkID);
+				}
+				s_title = INI.GetStringValue("game", "name");
+
 				ACJV::SetGameId(s_serial); // Adapt JVS input to detected GAMEID
 				std::string platform = INI.GetStringValue("game", "platform", "");
-				s_acgame_sys246 = (platform == "246" || platform == "256" || platform == "super256");
-				s_acgame_sys256 = (platform == "256" || platform == "super256");
-				if (platform == "super256")
-					PS2CLK = PS2CLK_SS256;
-				else if (s_acgame_sys256)
-					PS2CLK = PS2CLK_S256;
-				if (s_acgame_sys256)
-				{
-					Console.WriteLnFmt(Color_Green, "ACGAME: System {} requested — overclock will be applied", platform);
+
+				
+				if (const GameDatabaseSchema::GameEntry* db_entry = GameDatabase::findGame(s_serial)) {
+					if (platform.empty()) {
+						std::string_view s = db_entry->region;
+						if (s == "System246") {
+							PS2CLK = PS2CLK_DEFAULT;
+							s_acgame_sys256 = false;
+						} else if (s == "System256") {
+							PS2CLK = PS2CLK_S256;
+							s_acgame_sys256 = true;
+						} else if (s == "System SUPER256") {
+							PS2CLK = PS2CLK_SS256;
+							s_acgame_sys256 = true;
+						} else {
+							Error::SetString(error, TRANSLATE_STR("VMManager", "Cannot resolve platform variant"));
+							return false;
+						}
+					} else {
+						s_acgame_sys256 = (platform == "256" || platform == "super256");
+						PS2CLK = (platform == "super256") ? PS2CLK_SS256 : ((platform == "256") ? PS2CLK_S256 : PS2CLK_DEFAULT);
+					}
+					if (s_acmedia.empty()) {
+						s_acmedia = db_entry->arcade.media;
+						if (s_acmedia.empty()) {
+							Error::SetString(error, TRANSLATE_STR("VMManager", "Cannot resolve media type"));
+							return false;
+						}
+					}
+					if (s_title.empty() && !db_entry->name.empty()) {
+						s_title = db_entry->name;
+					}
 				}
+
+				if (PS2CLK != PS2CLK_DEFAULT)
+					Console.WriteLnFmt(Color_Green, "ACGAME: System {} requested — overclock will be applied", platform);
 
 				// When subdir= is set, basedir points to the subdir (e.g. roms/tekken4/).
 				// Dongle/card files may live elsewhere, so fall back to acgame dir and memcards/.
@@ -1373,36 +1423,28 @@ bool VMManager::AutoDetectSource(const std::string& filename, Error* error)
 				std::string card;
 				// Slot 1 (mc0:) = dongle (boot modules only, no save data).
 				// Always overwrite — DONGLEMAN corrupts this file at runtime.
-				if ((card = INI.GetStringValue("data", "dongle", "")) != "") {
-					std::string src = Path::Combine(basedir, card);
-					if (!FileSystem::FileExists(src.c_str()))
-						src = Path::Combine(acgamedir, card);
-					if (!FileSystem::FileExists(src.c_str()))
-						src = Path::Combine(Path::Combine(acgamedir, "memcards"), card);
-					std::string dst = Path::Combine(EmuFolders::MemoryCards, card);
-					if (FileSystem::FileExists(src.c_str()))
-						FileSystem::CopyFilePath(src.c_str(), dst.c_str(), true);
+				if ((card = INI.GetStringValue("data", "dongle", fmt::format("{}.ps2", s_serial).c_str())) != "") {
+					std::string src = Path::Combine(EmuFolders::MemoryCards, card);
+					if (!FileSystem::FileExists(src.c_str())) {
+						Error::SetStringFmt(error, "requested dongle image does not exist! '{}'", card);
+						Console.ErrorFmt("ACGAME: cannot open a dongle file at location '{}'", src);
+						return false;
+					}
 					Host::SetBaseStringSettingValue("MemoryCards", "Slot1_Filename", card.c_str());
 				}
 				// Slot 2 (mc1:) = save card (e.g. SC2 conquest). Never overwrite existing saves.
 				if ((card = INI.GetStringValue("data", "card", "")) != "") {
-					std::string src = Path::Combine(basedir, card);
-					if (!FileSystem::FileExists(src.c_str()))
-						src = Path::Combine(acgamedir, card);
-					if (!FileSystem::FileExists(src.c_str()))
-						src = Path::Combine(Path::Combine(acgamedir, "memcards"), card);
-					std::string dst = Path::Combine(EmuFolders::MemoryCards, card);
-					if (FileSystem::FileExists(src.c_str()) && !FileSystem::FileExists(dst.c_str()))
-						FileSystem::CopyFilePath(src.c_str(), dst.c_str(), false);
+					std::string src = Path::Combine(EmuFolders::MemoryCards, card);
+					if (!FileSystem::FileExists(src.c_str())) {
+						Error::SetStringFmt(error, "requested memcard image does not exist! '{}'", card);
+						Console.ErrorFmt("ACGAME: cannot open a card file at location '{}'", src);
+						return false;
+					}
 					Host::SetBaseStringSettingValue("MemoryCards", "Slot2_Filename", card.c_str());
-				}
-				/// TODOx6: Decide if we want to lock mc1 access if .ACGAME does not ask for it
-				//   Only SoulCalibur2 uses it, with the conquest card. yet many games bring a DONGLEMAN that can still access both ports
-				//   It SHOULD not be possible: but What if A game with the appropiate dongleman driver damages a conquest card?
-				// ---> else Host::SetBaseBoolSettingValue("MemoryCards", "Slot2_Enable", false);
+				} else Host::SetBaseStringSettingValue("MemoryCards", "Slot2_Filename", "");
 
 				//FileMcd_Reopen(s_serial);
-				s_elf_override = Path::Combine(basedir, INI.GetStringValue("data", "elf"));
+				s_elf_override = Path::Combine(basedir, INI.GetStringValue("data", "elf", "boot.elf"));
 				EmuConfig.CurrentGameArgs = INI.GetStringValue("data", "args");
 				ACSRAM::filepath = Path::Combine(basedir, INI.GetStringValue("data", "sram", "sram.bin"));
 				// JVS device mode: an explicit jvsmode= in the .acgame overrides (force/legacy); otherwise it is
@@ -1435,7 +1477,8 @@ bool VMManager::AutoDetectSource(const std::string& filename, Error* error)
 				ACATA::SetEnv(basedir, s_imgname, s_acmedia);
 				int R;
 				if ((R = ACATA::TH::IO_OpenImage())!=0) {
-					Error::SetString(error, std::string("cannot open arcade media image"));
+					Error::SetString(error, ACATA::TH::open_error.empty() ?
+						std::string("cannot open arcade media image") : ACATA::TH::open_error);
 					return false;
 				}
 				if (s_acmedia == "CD" && !ACATA::imgpath.empty()) {
@@ -1703,8 +1746,7 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 	s_cpu_implementation_changed = false;
 	UpdateCPUImplementations();
 	mmap_ResetBlockTracking();
-	if (s_acgame_sys246)
-		EmuConfig.Cpu.ExtraMemory = true;
+	EmuConfig.Cpu.ExtraMemory = true;
 	if (s_acgame_sys256)
 	{
 		s_sys256_mode = true;
@@ -1871,6 +1913,7 @@ void VMManager::Shutdown(bool save_resume_state)
 	s_elf_override = {};
 	s_acgame = {};
 	s_acgame_serial = {};
+	ArcadeiLinkID = {};
 	PS2CLK = PS2CLK_DEFAULT;
 	PSXCLK = 36864000;
 	s_sys256_mode = false;
@@ -3393,7 +3436,7 @@ void VMManager::ReloadPatches(bool reload_files, bool reload_enabled_list, bool 
 	if (!HasValidVM())
 		return;
 
-	Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? s_current_crc : 0, reload_files, reload_enabled_list, verbose, verbose_if_changed);
+	Patch::ReloadPatches(s_disc_serial, HasBootedELF() ? GetCRCForPatches() : 0, reload_files, reload_enabled_list, verbose, verbose_if_changed);
 
 	// Might change widescreen mode.
 	if (Patch::ReloadPatchAffectingOptions())

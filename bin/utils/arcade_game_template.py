@@ -81,15 +81,14 @@ for gameid, info in game_db.items():
         print(f"[FAIL] '{acgame_path}' no media type inside. skipping")
         continue
     
-    acgame = f"""
-[game]
+    acgame = f"""[game]
 name={name}
 gameid={gameid}
 platform={platform}
 
 [data]
 subdir={gameid}
-elf=proverb.elf
+elf=boot.elf
 dongle={gameid}.ps2
 mediasrc={gameid}.chd
 media={media}
