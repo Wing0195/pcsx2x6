@@ -901,10 +901,12 @@ if(WIN32)
 	list(APPEND pcsx2InputSources
 		Input/DInputSource.cpp
 		Input/XInputSource.cpp
+		Input/RawInputSource.cpp
 	)
 	list(APPEND pcsx2InputHeaders
 		Input/DInputSource.h
 		Input/XInputSource.h
+		Input/RawInputSource.h
 	)
 endif()
 
@@ -912,6 +914,7 @@ endif()
 set(pcsx2LinuxSources
 	CDVD/Linux/DriveUtility.cpp
 	CDVD/Linux/IOCtlSrc.cpp
+	Input/EvdevInputSource.cpp
 	)
 
 set(pcsx2OSXSources
@@ -926,6 +929,7 @@ set(pcsx2FreeBSDSources
 
 # Linux headers
 set(pcsx2LinuxHeaders
+	Input/EvdevInputSource.h
 	)
 
 # ps2 sources

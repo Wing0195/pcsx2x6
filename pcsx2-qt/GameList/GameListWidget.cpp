@@ -232,7 +232,7 @@ void GameListWidget::initialize()
 		}
 	}
 
-	for (u32 region = 0; region < static_cast<u32>(GameList::Region::Count); region++)
+	for (u32 region = static_cast<u32>(GameList::Region::SYSTEM246); region < static_cast<u32>(GameList::Region::Count); region++)
 	{
 		m_ui.filterRegion->addItem(GameListModel::getIconForRegion(static_cast<GameList::Region>(region)),
 			GameList::RegionToString(static_cast<GameList::Region>(region), true));
@@ -245,6 +245,7 @@ void GameListWidget::initialize()
 	connect(m_ui.filterType, &QComboBox::currentIndexChanged, this, [this](int index) {
 		m_sort_model->setFilterType((index == 0) ? GameList::EntryType::Count : static_cast<GameList::EntryType>(index - 1));
 	});
+	m_ui.filterType->setCurrentIndex(static_cast<int>(GameList::EntryType::ARCADE) + 1); // default to Arcade (index 0 = All Types)
 	connect(m_ui.filterRegion, &QComboBox::currentIndexChanged, this, [this](int index) {
 		m_sort_model->setFilterRegion((index == 0) ? GameList::Region::Count : static_cast<GameList::Region>(index - 1));
 	});
