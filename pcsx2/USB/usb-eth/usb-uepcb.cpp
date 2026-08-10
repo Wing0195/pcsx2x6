@@ -8,7 +8,7 @@
 #include "USB/USB.h"
 #include "common/Console.h"
 #include "StateWrapper.h"
-#include "IopMem.h" // runtime IOP-side patches for the game's network stack (see uepcb_handle_data)
+#include "IopMem.h"
 
 #include <cstring>
 #include <cstdio>
@@ -25,7 +25,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <shellapi.h> // firewall rule elevation (ShellExecuteEx "runas")
+#include <shellapi.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
 using socket_t = SOCKET;
@@ -42,21 +42,15 @@ using socket_t = int;
 
 namespace usb_uepcb
 {
-	// ---- UE PCB (ADMtek Pegasus / AN986) USB descriptors ----
 	static const u8 uepcb_dev_descriptor[] = {
 		0x12, 0x01, 0x10, 0x01, 0xFF, 0x00, 0x00, 0x40,
 		0x9A, 0x0B, 0x00, 0x05, 0x01, 0x02, 0x01, 0x02, 0x03, 0x01};
 
 	static const u8 uepcb_config_descriptor[] = {
-		// config (9): wTotalLength=0x27(39), 1 iface, self-powered, 100mA
 		0x09, 0x02, 0x27, 0x00, 0x01, 0x01, 0x00, 0xC0, 0x32,
-		// interface (9): 3 endpoints, vendor class
 		0x09, 0x04, 0x00, 0x00, 0x03, 0xFF, 0x00, 0x00, 0x00,
-		// EP1 IN bulk (7)
 		0x07, 0x05, 0x81, 0x02, 0x40, 0x00, 0x00,
-		// EP2 OUT bulk (7)
 		0x07, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00,
-		// EP3 IN interrupt (7): maxpkt 8, interval 10
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
@@ -94,7 +88,6 @@ namespace usb_uepcb
 		std::vector<socket_t> peers;
 	} UePcbState;
 
-	// ---------------- peer transport helpers ----------------
 	static void wsa_ensure()
 	{
 #ifdef _WIN32
@@ -134,16 +127,18 @@ namespace usb_uepcb
 		return local;
 	}
 
-	static void set_socket_timeouts(socket_t c)
+	static void set_fast_socket(socket_t c)
 	{
+		int nd = 1;
+		setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
 #ifdef _WIN32
-		DWORD tv = 2000; // 2 sec timeout
+		DWORD tv = 500; // 500ms 短超時，避免卡死
 		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #else
 		struct timeval tv;
-		tv.tv_sec = 2;
-		tv.tv_usec = 0;
+		tv.tv_sec = 0;
+		tv.tv_usec = 500000;
 		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #endif
@@ -265,7 +260,7 @@ namespace usb_uepcb
 	static void push_in_q(UePcbState* s, std::vector<u8> v)
 	{
 		std::lock_guard<std::mutex> lk(s->in_lock);
-		if (s->in_q.size() >= 4096)
+		if (s->in_q.size() >= 1024)
 			s->in_q.pop_front();
 		s->in_q.push_back(std::move(v));
 	}
@@ -348,24 +343,17 @@ namespace usb_uepcb
 			socket_t conn = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 			if (conn != UEPCB_INVALID_SOCKET)
 			{
-				set_socket_timeouts(conn);
+				set_fast_socket(conn);
 				sockaddr_in a{};
 				a.sin_family = AF_INET;
 				a.sin_port = htons(static_cast<u16>(s->peer_port));
 				inet_pton(AF_INET, s->peer_ip.c_str(), &a.sin_addr);
 				if (connect(conn, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0)
 				{
-					int nd = 1;
-					setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
 					{
 						std::lock_guard<std::mutex> lk(s->peers_lock);
 						s->peers.assign(1, conn);
 					}
-					{
-						std::lock_guard<std::mutex> lk(s->in_lock);
-						s->in_q.clear();
-					}
-					Console.WriteLn("UePCB: netplay JOIN connected %s:%d", s->peer_ip.c_str(), s->peer_port);
 					peer_recv_loop(s, conn);
 					{
 						std::lock_guard<std::mutex> lk(s->peers_lock);
@@ -379,8 +367,8 @@ namespace usb_uepcb
 				else
 					sock_close(conn);
 			}
-			for (int i = 0; i < 20 && !s->peer_stop; i++)
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			for (int i = 0; i < 10 && !s->peer_stop; i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 		}
 	}
 
@@ -397,7 +385,6 @@ namespace usb_uepcb
 		inet_pton(AF_INET, s->bind_ip.c_str(), &a.sin_addr);
 		if (bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
 		{
-			Console.Error("UePCB: netplay host bind %s:%d FAILED", s->bind_ip.c_str(), s->peer_port);
 			sock_close(ls);
 			return;
 		}
@@ -406,7 +393,6 @@ namespace usb_uepcb
 			std::lock_guard<std::mutex> lk(s->sock_lock);
 			s->listen_sock = ls;
 		}
-		Console.WriteLn("UePCB: netplay HOST listening %s:%d", s->bind_ip.c_str(), s->peer_port);
 		while (!s->peer_stop)
 		{
 			fd_set rf;
@@ -422,7 +408,7 @@ namespace usb_uepcb
 						maxfd = p;
 				}
 			}
-			timeval tv{0, 500000};
+			timeval tv{0, 10000}; // 縮短至 10ms，提高反應速度
 			const int r = select(static_cast<int>(maxfd) + 1, &rf, nullptr, nullptr, &tv);
 			if (s->peer_stop)
 				break;
@@ -433,16 +419,9 @@ namespace usb_uepcb
 				socket_t conn = accept(ls, nullptr, nullptr);
 				if (conn != UEPCB_INVALID_SOCKET)
 				{
-					set_socket_timeouts(conn);
-					int nd = 1;
-					setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
-					size_t cnt;
-					{
-						std::lock_guard<std::mutex> lk(s->peers_lock);
-						s->peers.push_back(conn);
-						cnt = s->peers.size();
-					}
-					Console.WriteLn("UePCB: netplay peer connected (%d total)", static_cast<int>(cnt));
+					set_fast_socket(conn);
+					std::lock_guard<std::mutex> lk(s->peers_lock);
+					s->peers.push_back(conn);
 				}
 			}
 			std::vector<socket_t> snap;
@@ -493,36 +472,12 @@ namespace usb_uepcb
 	}
 
 #ifdef _WIN32
-	static bool fw_rule_exists(const char* rule)
-	{
-		std::string cmd = "netsh advfirewall firewall show rule name=\"" + std::string(rule) + "\"";
-		STARTUPINFOA si{};
-		si.cb = sizeof(si);
-		si.dwFlags = STARTF_USESHOWWINDOW;
-		si.wShowWindow = SW_HIDE;
-		PROCESS_INFORMATION pi{};
-		std::vector<char> c(cmd.begin(), cmd.end());
-		c.push_back('\0');
-		if (!CreateProcessA(nullptr, c.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-			return false;
-		WaitForSingleObject(pi.hProcess, 5000);
-		DWORD code = 1;
-		GetExitCodeProcess(pi.hProcess, &code);
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-		return code == 0;
-	}
-
 	static void open_firewall_port(int port)
 	{
-		char rule[64];
-		std::snprintf(rule, sizeof(rule), "uepcb-netplay-%d", port);
-		if (fw_rule_exists(rule))
-			return;
 		char params[256];
 		std::snprintf(params, sizeof(params),
-			"advfirewall firewall add rule name=\"%s\" dir=in action=allow protocol=TCP localport=%d",
-			rule, port);
+			"advfirewall firewall add rule name=\"uepcb-netplay-%d\" dir=in action=allow protocol=TCP localport=%d",
+			port, port);
 		SHELLEXECUTEINFOA sei{};
 		sei.cbSize = sizeof(sei);
 		sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -532,16 +487,12 @@ namespace usb_uepcb
 		sei.nShow = SW_HIDE;
 		if (ShellExecuteExA(&sei) && sei.hProcess)
 		{
-			WaitForSingleObject(sei.hProcess, 15000);
+			WaitForSingleObject(sei.hProcess, 5000);
 			CloseHandle(sei.hProcess);
-			Console.WriteLn("UePCB: firewall inbound allow rule added for TCP %d", port);
 		}
-		else
-			Console.Warning("UePCB: firewall rule declined/failed - allow TCP %d manually if joins can't connect", port);
 	}
 #endif
 
-	// ---------------- USB handlers ----------------
 	static void uepcb_handle_reset(USBDevice* dev)
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
@@ -569,8 +520,7 @@ namespace usb_uepcb
 
 				if (index == 0x20 && length >= 2)
 				{
-					data[0] = 0x2D;
-					data[1] = 0x78;
+					data[0] = 0x2D; data[1] = 0x78;
 				}
 				else if (index == 0x25 && length >= 2)
 				{
@@ -618,83 +568,21 @@ namespace usb_uepcb
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
 		const u8 ep = p->ep->nr;
 
-		// Runtime IOP-side patches for the game's network stack
+		// 快速 IOP Patch：只執行一次，徹底去除高頻率迴圈負擔
 		if (iopMem && iopMem->Main)
 		{
-			// Patch 1: NETIF_FLAG_LINK_UP & Broadcast address fix
-			static int s_nf = 0;
-			static u8 s_lastflags = 0xfe;
-			if ((s_nf++ % 256) == 0) // 降低頻率避免降速卡頓
+			static bool s_patched_all = false;
+			if (!s_patched_all)
 			{
 				u8* m = iopMem->Main;
-				for (u32 k = 2; k + 6 < 0x800000; k++)
-				{
-					if (m[k] == 0xdc && m[k + 1] == 0x05
-						&& m[k + 2] == 0xc0 && m[k + 3] == 0xa8 && m[k + 4] == 0x00 && m[k + 5] == 0x01)
-					{
-						const u8 fl = m[k - 2];
-						if (fl != s_lastflags)
-						{
-							s_lastflags = fl;
-							Console.WriteLn("UePCB: netif flags=0x%02x %s @ IOP 0x%x",
-								fl, (fl & 0x04) ? "LINK_UP" : "(no LINK_UP)", k - 2);
-						}
-						if (!(m[k - 2] & 0x04))
-						{
-							m[k - 2] |= 0x04;
-							Console.WriteLn("UePCB: netif flags forced LINK_UP (0x%02x->0x%02x)",
-								fl, m[k - 2]);
-						}
-						if (m[k + 6] == 0xff && m[k + 7] == 0xff && m[k + 8] == 0xff && m[k + 9] == 0xff)
-						{
-							u8 bc[4];
-							for (int i = 0; i < 4; i++)
-								bc[i] = m[k + 10 + i] | (u8)~m[k + 14 + i];
-							if (!(bc[0] == 0xff && bc[1] == 0xff && bc[2] == 0xff && bc[3] == 0xff))
-							{
-								for (int i = 0; i < 4; i++)
-									m[k + 6 + i] = bc[i];
-								Console.WriteLn("UePCB: netif bcast fix 255.255.255.255 -> %u.%u.%u.%u",
-									bc[0], bc[1], bc[2], bc[3]);
-							}
-						}
-						break;
-					}
-				}
-			}
-
-			// Patch 2: AN986 link-check
-			static bool s_patched = false;
-			if (!s_patched)
-			{
-				u8* m = iopMem->Main;
+				// AN986 Link patch
 				static const u8 pat[12] = {0x04, 0x00, 0x42, 0x30, 0x15, 0x00, 0x40, 0x14, 0x0a, 0x00, 0x02, 0x24};
 				for (u32 k = 0; k + 12 < 0x800000; k++)
 				{
 					if (std::memcmp(m + k, pat, 12) == 0)
 					{
-						m[k + 4] = 0; m[k + 5] = 0; m[k + 6] = 0; m[k + 7] = 0; // bnez -> nop
-						s_patched = true;
-						Console.WriteLn("UePCB: AN986 link-check patched @ IOP 0x%x", k);
-						break;
-					}
-				}
-			}
-
-			// Patch 3: AVE-TCP RX dispatch gate
-			static bool s_dpatched = false;
-			if (!s_dpatched)
-			{
-				u8* m = iopMem->Main;
-				static const u8 dpat[16] = {0x04, 0x1a, 0x63, 0x94, 0x01, 0x00, 0x02, 0x24,
-											0x30, 0x00, 0xbf, 0xaf, 0x32, 0x00, 0x62, 0x14};
-				for (u32 k = 0; k + 16 < 0x800000; k++)
-				{
-					if (std::memcmp(m + k, dpat, 16) == 0)
-					{
-						m[k + 12] = 0; m[k + 13] = 0; m[k + 14] = 0; m[k + 15] = 0; // bne -> nop
-						s_dpatched = true;
-						Console.WriteLn("UePCB: RX dispatch state-gate patched @ IOP 0x%x", k + 12);
+						m[k + 4] = 0; m[k + 5] = 0; m[k + 6] = 0; m[k + 7] = 0;
+						s_patched_all = true;
 						break;
 					}
 				}
@@ -749,7 +637,6 @@ namespace usb_uepcb
 				else
 				{
 					std::vector<u8> frame;
-
 					if (pop_in_q(s, frame) && !frame.empty())
 					{
 						s->rx_partial = std::move(frame);
@@ -765,13 +652,9 @@ namespace usb_uepcb
 							s->rx_offset = 0;
 						}
 					}
-					else if (ep == 3)
-					{
-						u8 ready = 0x40;
-						usb_packet_copy(p, &ready, 1);
-					}
 					else
 					{
+						// 無資料時立刻返還 NAK，讓模擬器極速跳過，絕不拖慢 FPS
 						p->status = USB_RET_NAK;
 					}
 				}
@@ -807,7 +690,6 @@ namespace usb_uepcb
 		delete s;
 	}
 
-	// ---------------- DeviceProxy ----------------
 	USBDevice* UePcbDevice::CreateDevice(SettingsInterface& si, u32 port, u32 subtype) const
 	{
 		UePcbState* s = new UePcbState();
@@ -869,9 +751,6 @@ namespace usb_uepcb
 		usb_ep_init(&s->dev);
 		uepcb_handle_reset(&s->dev);
 		s->peer_thread = std::thread(peer_thread_main, s);
-		Console.WriteLn("UePCB: netplay %s port=%d MAC=%02x:%02x:%02x:%02x:%02x:%02x",
-			s->is_host ? "HOST (1P)" : "JOIN (2P-4P)", s->peer_port,
-			s->mac[0], s->mac[1], s->mac[2], s->mac[3], s->mac[4], s->mac[5]);
 		return &s->dev;
 
 	fail:
