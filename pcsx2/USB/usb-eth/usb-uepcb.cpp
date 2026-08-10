@@ -42,11 +42,6 @@ using socket_t = int;
 
 namespace usb_uepcb
 {
-	// Gemini fix 2.0 - host local fast-path + lower patch scan frequency
-	// - Keeps TCP hub, unique MACs, and cross-PC support
-	// - Reduces same-PC 4-instance timing variance
-	// - Keeps 64B BULK IN segmentation and AN986 padding fixes
-
 	// ---- UE PCB (ADMtek Pegasus / AN986) USB descriptors ----
 	static const u8 uepcb_dev_descriptor[] = {
 		0x12, 0x01, 0x10, 0x01, 0xFF, 0x00, 0x00, 0x40,
@@ -629,7 +624,7 @@ namespace usb_uepcb
 			// Patch 1: NETIF_FLAG_LINK_UP & Broadcast address fix
 			static int s_nf = 0;
 			static u8 s_lastflags = 0xfe;
-			if ((s_nf++ % 1024) == 0) // 降低頻率避免降速卡頓
+			if ((s_nf++ % 256) == 0) // 降低頻率避免降速卡頓
 			{
 				u8* m = iopMem->Main;
 				for (u32 k = 2; k + 6 < 0x800000; k++)
@@ -731,20 +726,7 @@ namespace usb_uepcb
 					int n = std::min<int>(total, (int)sizeof(buf));
 					std::memcpy(buf, s->tx_accum.data(), n);
 					s->tx_accum.erase(s->tx_accum.begin(), s->tx_accum.begin() + total);
-
-					// Host local fast-path: deliver to the local emulated NIC immediately
-					// and flood only to remote peers. This reduces the small timing
-					// difference between 1P and the joined players during same-PC
-					// 4-instance tests.
-					if (s->is_host)
-					{
-						push_in_q(s, to_bulkin(buf + 2, ethlen));
-						hub_flood(s, UEPCB_INVALID_SOCKET, buf + 2, ethlen);
-					}
-					else
-					{
-						peer_send_all(s, buf + 2, ethlen);
-					}
+					peer_send_all(s, buf + 2, ethlen);
 				}
 				break;
 			}
