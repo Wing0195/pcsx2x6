@@ -54,7 +54,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v2.5", ""};
+		"", "Namco", "UE PCB v2.6", ""};
 
 	typedef struct UePcbState
 	{
@@ -132,13 +132,13 @@ namespace usb_uepcb
 		int nd = 1;
 		setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
 #ifdef _WIN32
-		DWORD tv = 200; // 降低超時等待，提升響應速度
+		DWORD tv = 500;
 		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #else
 		struct timeval tv;
 		tv.tv_sec = 0;
-		tv.tv_usec = 200000;
+		tv.tv_usec = 500000;
 		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #endif
@@ -257,14 +257,18 @@ namespace usb_uepcb
 		return v;
 	}
 
-	// [v2.5 新增] 佇列防積壓機制 (Anti-Stall Queue Flush)
+	// [v2.6 修復] 安全的防積壓佇列 (Safe Queue FIFO)
 	static void push_in_q(UePcbState* s, std::vector<u8> v)
 	{
 		std::lock_guard<std::mutex> lk(s->in_lock);
-		// 當佇列積壓超過 2 個封包時，清空舊封包只留最新封包，防止高度不同步
-		if (s->in_q.size() >= 2)
+		// 只有在初始化完成後才進行彈性平滑，且只剔除最舊的一個，絕不一次清空
+		if (s->init_done && s->in_q.size() >= 8)
 		{
-			s->in_q.clear();
+			s->in_q.pop_front();
+		}
+		else if (!s->init_done && s->in_q.size() >= 1024)
+		{
+			s->in_q.pop_front();
 		}
 		s->in_q.push_back(std::move(v));
 	}
@@ -412,7 +416,7 @@ namespace usb_uepcb
 						maxfd = p;
 				}
 			}
-			timeval tv{0, 10000}; // 10ms Select polling
+			timeval tv{0, 10000};
 			const int r = select(static_cast<int>(maxfd) + 1, &rf, nullptr, nullptr, &tv);
 			if (s->peer_stop)
 				break;
@@ -572,7 +576,6 @@ namespace usb_uepcb
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
 		const u8 ep = p->ep->nr;
 
-		// 快速 IOP Patch：單次精確命中，維持高 FPS
 		if (iopMem && iopMem->Main)
 		{
 			static bool s_patched_all = false;
@@ -657,7 +660,6 @@ namespace usb_uepcb
 					}
 					else
 					{
-						// 無數據時立刻返還 NAK，讓 CPU 不等候
 						p->status = USB_RET_NAK;
 					}
 				}
@@ -761,7 +763,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade net v2.5)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade net v2.6)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
