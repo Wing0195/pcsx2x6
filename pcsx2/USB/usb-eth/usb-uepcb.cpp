@@ -54,7 +54,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v2.6", ""};
+		"", "Namco", "UE PCB v2.7 (Hardware Lockstep)", ""};
 
 	typedef struct UePcbState
 	{
@@ -132,13 +132,13 @@ namespace usb_uepcb
 		int nd = 1;
 		setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
 #ifdef _WIN32
-		DWORD tv = 500;
+		DWORD tv = 1000;
 		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #else
 		struct timeval tv;
-		tv.tv_sec = 0;
-		tv.tv_usec = 500000;
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
 		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #endif
@@ -257,30 +257,40 @@ namespace usb_uepcb
 		return v;
 	}
 
-	// [v2.6 修復] 安全的防積壓佇列 (Safe Queue FIFO)
 	static void push_in_q(UePcbState* s, std::vector<u8> v)
 	{
 		std::lock_guard<std::mutex> lk(s->in_lock);
-		// 只有在初始化完成後才進行彈性平滑，且只剔除最舊的一個，絕不一次清空
-		if (s->init_done && s->in_q.size() >= 8)
-		{
-			s->in_q.pop_front();
-		}
-		else if (!s->init_done && s->in_q.size() >= 1024)
-		{
-			s->in_q.pop_front();
-		}
 		s->in_q.push_back(std::move(v));
 	}
 
-	static bool pop_in_q(UePcbState* s, std::vector<u8>& out)
+	// [v2.7 重要修復] 實機鎖步等待 (Lockstep Throttle)
+	// 當無封包時不立刻丟出 NAK，而是做極短微秒微調，模擬實機在密集輸入時的放慢鎖步
+	static bool pop_in_q_lockstep(UePcbState* s, std::vector<u8>& out)
 	{
-		std::lock_guard<std::mutex> lk(s->in_lock);
-		if (s->in_q.empty())
-			return false;
-		out = std::move(s->in_q.front());
-		s->in_q.pop_front();
-		return true;
+		std::unique_lock<std::mutex> lk(s->in_lock);
+		if (!s->in_q.empty())
+		{
+			out = std::move(s->in_q.front());
+			s->in_q.pop_front();
+			return true;
+		}
+
+		if (s->init_done)
+		{
+			// 解鎖並微調 1.5 毫秒（模擬 IOP 鎖步等待）
+			lk.unlock();
+			std::this_thread::sleep_for(std::chrono::microseconds(1500));
+			lk.lock();
+
+			if (!s->in_q.empty())
+			{
+				out = std::move(s->in_q.front());
+				s->in_q.pop_front();
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	static void peer_recv_loop(UePcbState* s, socket_t conn)
@@ -416,7 +426,7 @@ namespace usb_uepcb
 						maxfd = p;
 				}
 			}
-			timeval tv{0, 10000};
+			timeval tv{0, 2000}; // 2ms Select loop 提升傳輸敏感度
 			const int r = select(static_cast<int>(maxfd) + 1, &rf, nullptr, nullptr, &tv);
 			if (s->peer_stop)
 				break;
@@ -643,7 +653,8 @@ namespace usb_uepcb
 				else
 				{
 					std::vector<u8> frame;
-					if (pop_in_q(s, frame) && !frame.empty())
+					// 呼叫 2.7 微妙鎖步等待
+					if (pop_in_q_lockstep(s, frame) && !frame.empty())
 					{
 						s->rx_partial = std::move(frame);
 						s->rx_offset = 0;
@@ -763,7 +774,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade net v2.6)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade net v2.7 Lockstep)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
