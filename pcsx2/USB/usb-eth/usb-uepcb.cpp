@@ -33,7 +33,6 @@ using socket_t = SOCKET;
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 using socket_t = int;
@@ -54,7 +53,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v2.8 (EventFlag Fast-Poll)", ""};
+		"", "Namco", "UE PCB v2.9 (UDP Mesh Engine)", ""};
 
 	typedef struct UePcbState
 	{
@@ -69,23 +68,20 @@ namespace usb_uepcb
 		std::vector<u8> rx_partial;
 		size_t rx_offset = 0;
 
-		bool is_host = false;
 		u8 mac[6] = {0x00, 0x90, 0x2E, 0x11, 0x22, 0x33};
-		int peer_port = 7500;
-		std::string peer_ip;
-		std::string bind_ip;
+		int udp_port = 7500;
+		std::string broadcast_ip;
 		u8 mii_phyaddr = 1;
 		u8 mii_reg = 1;
 		bool init_done = false;
 		bool link_event_sent = false;
+
 		std::mutex in_lock;
 		std::deque<std::vector<u8>> in_q;
-		std::mutex sock_lock;
-		socket_t listen_sock = UEPCB_INVALID_SOCKET;
-		std::thread peer_thread;
-		std::atomic<bool> peer_stop{false};
-		std::mutex peers_lock;
-		std::vector<socket_t> peers;
+
+		socket_t udp_sock = UEPCB_INVALID_SOCKET;
+		std::thread recv_thread;
+		std::atomic<bool> thread_stop{false};
 	} UePcbState;
 
 	static void wsa_ensure()
@@ -107,67 +103,6 @@ namespace usb_uepcb
 #else
 		close(x);
 #endif
-	}
-
-	static bool ip_is_own(const std::string& ip)
-	{
-		if (ip.empty() || ip == "0.0.0.0" || ip.rfind("127.", 0) == 0)
-			return false;
-		wsa_ensure();
-		sockaddr_in a{};
-		a.sin_family = AF_INET;
-		a.sin_port = 0;
-		if (inet_pton(AF_INET, ip.c_str(), &a.sin_addr) != 1)
-			return false;
-		socket_t t = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (t == UEPCB_INVALID_SOCKET)
-			return false;
-		const bool local = (bind(t, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
-		sock_close(t);
-		return local;
-	}
-
-	static void set_fast_socket(socket_t c)
-	{
-		int nd = 1;
-		setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
-#ifdef _WIN32
-		DWORD tv = 100; // 降至 100ms 避免任何網路等待卡死
-		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-		struct timeval tv;
-		tv.tv_sec = 0;
-		tv.tv_usec = 100000;
-		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#endif
-	}
-
-	static bool recv_exact(socket_t c, u8* buf, int len)
-	{
-		int off = 0;
-		while (off < len)
-		{
-			const int n = recv(c, reinterpret_cast<char*>(buf + off), len - off, 0);
-			if (n <= 0)
-				return false;
-			off += n;
-		}
-		return true;
-	}
-
-	static bool send_exact(socket_t c, const u8* buf, int len)
-	{
-		int off = 0;
-		while (off < len)
-		{
-			const int n = send(c, reinterpret_cast<const char*>(buf + off), len - off, 0);
-			if (n <= 0)
-				return false;
-			off += n;
-		}
-		return true;
 	}
 
 	static u16 mii_val(u8 reg)
@@ -257,242 +192,49 @@ namespace usb_uepcb
 		return v;
 	}
 
-	static void push_in_q(UePcbState* s, std::vector<u8> v)
+	static void udp_recv_loop(UePcbState* s)
 	{
-		std::lock_guard<std::mutex> lk(s->in_lock);
-		s->in_q.push_back(std::move(v));
-	}
-
-	// [v2.8 修復] 零延遲非阻塞彈出
-	static bool pop_in_q_fast(UePcbState* s, std::vector<u8>& out)
-	{
-		std::lock_guard<std::mutex> lk(s->in_lock);
-		if (!s->in_q.empty())
+		u8 buf[2048];
+		while (!s->thread_stop)
 		{
-			out = std::move(s->in_q.front());
-			s->in_q.pop_front();
-			return true;
-		}
-		return false;
-	}
-
-	static void peer_recv_loop(UePcbState* s, socket_t conn)
-	{
-		while (!s->peer_stop)
-		{
-			u8 hdr[4];
-			if (!recv_exact(conn, hdr, 4))
-				break;
-			const u32 ln = (hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
-			if (ln < 14 || ln > 2048)
-				break;
-			std::vector<u8> eth(ln);
-			if (!recv_exact(conn, eth.data(), ln))
-				break;
-			push_in_q(s, to_bulkin(eth.data(), static_cast<int>(eth.size())));
-		}
-	}
-
-	static void peer_send_all(UePcbState* s, const u8* eth, int len)
-	{
-		const u8 hdr[4] = {static_cast<u8>((len >> 24) & 0xFF), static_cast<u8>((len >> 16) & 0xFF),
-			static_cast<u8>((len >> 8) & 0xFF), static_cast<u8>(len & 0xFF)};
-		std::lock_guard<std::mutex> lk(s->peers_lock);
-		for (socket_t p : s->peers)
-		{
-			if (p != UEPCB_INVALID_SOCKET)
-			{
-				send_exact(p, hdr, 4);
-				send_exact(p, eth, len);
-			}
-		}
-	}
-
-	static void hub_remove(UePcbState* s, socket_t p)
-	{
-		std::lock_guard<std::mutex> lk(s->peers_lock);
-		for (auto it = s->peers.begin(); it != s->peers.end(); ++it)
-		{
-			if (*it == p)
-			{
-				s->peers.erase(it);
-				break;
-			}
-		}
-		sock_close(p);
-	}
-
-	static void hub_flood(UePcbState* s, socket_t src, const u8* eth, int len)
-	{
-		const u8 hdr[4] = {static_cast<u8>((len >> 24) & 0xFF), static_cast<u8>((len >> 16) & 0xFF),
-			static_cast<u8>((len >> 8) & 0xFF), static_cast<u8>(len & 0xFF)};
-		std::lock_guard<std::mutex> lk(s->peers_lock);
-		for (socket_t p : s->peers)
-		{
-			if (p != src && p != UEPCB_INVALID_SOCKET)
-			{
-				send_exact(p, hdr, 4);
-				send_exact(p, eth, len);
-			}
-		}
-	}
-
-	static void hub_join_loop(UePcbState* s)
-	{
-		while (!s->peer_stop)
-		{
-			socket_t conn = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-			if (conn != UEPCB_INVALID_SOCKET)
-			{
-				set_fast_socket(conn);
-				sockaddr_in a{};
-				a.sin_family = AF_INET;
-				a.sin_port = htons(static_cast<u16>(s->peer_port));
-				inet_pton(AF_INET, s->peer_ip.c_str(), &a.sin_addr);
-				if (connect(conn, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0)
-				{
-					{
-						std::lock_guard<std::mutex> lk(s->peers_lock);
-						s->peers.assign(1, conn);
-					}
-					peer_recv_loop(s, conn);
-					{
-						std::lock_guard<std::mutex> lk(s->peers_lock);
-						if (!s->peers.empty())
-						{
-							sock_close(s->peers[0]);
-							s->peers.clear();
-						}
-					}
-				}
-				else
-					sock_close(conn);
-			}
-			for (int i = 0; i < 10 && !s->peer_stop; i++)
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
-		}
-	}
-
-	static void hub_host_loop(UePcbState* s)
-	{
-		socket_t ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (ls == UEPCB_INVALID_SOCKET)
-			return;
-		int one = 1;
-		setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
-		sockaddr_in a{};
-		a.sin_family = AF_INET;
-		a.sin_port = htons(static_cast<u16>(s->peer_port));
-		inet_pton(AF_INET, s->bind_ip.c_str(), &a.sin_addr);
-		if (bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
-		{
-			sock_close(ls);
-			return;
-		}
-		listen(ls, 8);
-		{
-			std::lock_guard<std::mutex> lk(s->sock_lock);
-			s->listen_sock = ls;
-		}
-		while (!s->peer_stop)
-		{
-			fd_set rf;
-			FD_ZERO(&rf);
-			FD_SET(ls, &rf);
-			socket_t maxfd = ls;
-			{
-				std::lock_guard<std::mutex> lk(s->peers_lock);
-				for (socket_t p : s->peers)
-				{
-					FD_SET(p, &rf);
-					if (p > maxfd)
-						maxfd = p;
-				}
-			}
-			timeval tv{0, 1000}; // 1ms 輪詢，保持極致響應
-			const int r = select(static_cast<int>(maxfd) + 1, &rf, nullptr, nullptr, &tv);
-			if (s->peer_stop)
-				break;
-			if (r <= 0)
-				continue;
-			if (FD_ISSET(ls, &rf))
-			{
-				socket_t conn = accept(ls, nullptr, nullptr);
-				if (conn != UEPCB_INVALID_SOCKET)
-				{
-					set_fast_socket(conn);
-					std::lock_guard<std::mutex> lk(s->peers_lock);
-					s->peers.push_back(conn);
-				}
-			}
-			std::vector<socket_t> snap;
-			{
-				std::lock_guard<std::mutex> lk(s->peers_lock);
-				snap = s->peers;
-			}
-			for (socket_t p : snap)
-			{
-				if (!FD_ISSET(p, &rf))
-					continue;
-				u8 hdr[4];
-				if (!recv_exact(p, hdr, 4))
-				{
-					hub_remove(s, p);
-					continue;
-				}
-				const u32 ln = (hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
-				if (ln < 14 || ln > 2048)
-				{
-					hub_remove(s, p);
-					continue;
-				}
-				std::vector<u8> eth(ln);
-				if (!recv_exact(p, eth.data(), ln))
-				{
-					hub_remove(s, p);
-					continue;
-				}
-				push_in_q(s, to_bulkin(eth.data(), static_cast<int>(ln)));
-				hub_flood(s, p, eth.data(), static_cast<int>(ln));
-			}
-		}
-		std::lock_guard<std::mutex> lk(s->peers_lock);
-		for (socket_t p : s->peers)
-			if (p != UEPCB_INVALID_SOCKET)
-				sock_close(p);
-		s->peers.clear();
-	}
-
-	static void peer_thread_main(UePcbState* s)
-	{
-		wsa_ensure();
-		if (s->is_host)
-			hub_host_loop(s);
-		else
-			hub_join_loop(s);
-	}
-
+			sockaddr_in src_addr{};
 #ifdef _WIN32
-	static void open_firewall_port(int port)
-	{
-		char params[256];
-		std::snprintf(params, sizeof(params),
-			"advfirewall firewall add rule name=\"uepcb-netplay-%d\" dir=in action=allow protocol=TCP localport=%d",
-			port, port);
-		SHELLEXECUTEINFOA sei{};
-		sei.cbSize = sizeof(sei);
-		sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-		sei.lpVerb = "runas";
-		sei.lpFile = "netsh";
-		sei.lpParameters = params;
-		sei.nShow = SW_HIDE;
-		if (ShellExecuteExA(&sei) && sei.hProcess)
-		{
-			WaitForSingleObject(sei.hProcess, 5000);
-			CloseHandle(sei.hProcess);
+			int addr_len = sizeof(src_addr);
+#else
+			socklen_t addr_len = sizeof(src_addr);
+#endif
+			int n = recvfrom(s->udp_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+				reinterpret_cast<sockaddr*>(&src_addr), &addr_len);
+
+			if (n >= 14)
+			{
+				// 防自我環回（Filter Out Self Packets by MAC）
+				if (std::memcmp(buf + 6, s->mac, 6) != 0)
+				{
+					std::lock_guard<std::mutex> lk(s->in_lock);
+					// 保留適當的 Queue 深度，避免 PS2 sceInet 記憶體爆掉
+					if (s->in_q.size() < 64)
+					{
+						s->in_q.push_back(to_bulkin(buf, n));
+					}
+				}
+			}
 		}
 	}
-#endif
+
+	static void udp_send_packet(UePcbState* s, const u8* eth, int len)
+	{
+		if (s->udp_sock == UEPCB_INVALID_SOCKET)
+			return;
+
+		sockaddr_in dst{};
+		dst.sin_family = AF_INET;
+		dst.sin_port = htons(static_cast<u16>(s->udp_port));
+		inet_pton(AF_INET, s->broadcast_ip.c_str(), &dst.sin_addr);
+
+		sendto(s->udp_sock, reinterpret_cast<const char*>(eth), len, 0,
+			reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+	}
 
 	static void uepcb_handle_reset(USBDevice* dev)
 	{
@@ -612,7 +354,9 @@ namespace usb_uepcb
 					int n = std::min<int>(total, (int)sizeof(buf));
 					std::memcpy(buf, s->tx_accum.data(), n);
 					s->tx_accum.erase(s->tx_accum.begin(), s->tx_accum.begin() + total);
-					peer_send_all(s, buf + 2, ethlen);
+
+					// 發送 UDP P2P 廣播封包
+					udp_send_packet(s, buf + 2, ethlen);
 				}
 				break;
 			}
@@ -634,11 +378,11 @@ namespace usb_uepcb
 				}
 				else
 				{
-					std::vector<u8> frame;
-					// 零延遲秒回，把等待留給 PS2 內部的 WaitEventFlag
-					if (pop_in_q_fast(s, frame) && !frame.empty())
+					std::lock_guard<std::mutex> lk(s->in_lock);
+					if (!s->in_q.empty())
 					{
-						s->rx_partial = std::move(frame);
+						s->rx_partial = std::move(s->in_q.front());
+						s->in_q.pop_front();
 						s->rx_offset = 0;
 
 						const int copyLen = std::min<int>(p->buffer_size, static_cast<int>(s->rx_partial.size()));
@@ -667,44 +411,24 @@ namespace usb_uepcb
 	static void uepcb_handle_destroy(USBDevice* dev)
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		s->peer_stop = true;
+		s->thread_stop = true;
+		if (s->udp_sock != UEPCB_INVALID_SOCKET)
 		{
-			std::lock_guard<std::mutex> lk(s->sock_lock);
-			if (s->listen_sock != UEPCB_INVALID_SOCKET)
-			{
-				sock_close(s->listen_sock);
-				s->listen_sock = UEPCB_INVALID_SOCKET;
-			}
+			sock_close(s->udp_sock);
+			s->udp_sock = UEPCB_INVALID_SOCKET;
 		}
-		{
-			std::lock_guard<std::mutex> lk(s->peers_lock);
-			for (socket_t p : s->peers)
-				if (p != UEPCB_INVALID_SOCKET)
-					sock_close(p);
-			s->peers.clear();
-		}
-		if (s->peer_thread.joinable())
-			s->peer_thread.join();
+		if (s->recv_thread.joinable())
+			s->recv_thread.join();
 		delete s;
 	}
 
 	USBDevice* UePcbDevice::CreateDevice(SettingsInterface& si, u32 port, u32 subtype) const
 	{
+		wsa_ensure();
 		UePcbState* s = new UePcbState();
 		{
-			const std::string peer = USB::GetConfigString(si, port, TypeName(), "PeerIP", "");
-			const bool has_peer = !peer.empty() && peer != "0.0.0.0";
-			s->is_host = !has_peer || ip_is_own(peer);
-			s->peer_port = USB::GetConfigInt(si, port, TypeName(), "Port", 7500);
-			if (s->is_host)
-			{
-				s->bind_ip = USB::GetConfigString(si, port, TypeName(), "BindIP", "0.0.0.0");
-#ifdef _WIN32
-				open_firewall_port(s->peer_port);
-#endif
-			}
-			else
-				s->peer_ip = peer;
+			s->broadcast_ip = USB::GetConfigString(si, port, TypeName(), "TargetIP", "255.255.255.255");
+			s->udp_port = USB::GetConfigInt(si, port, TypeName(), "Port", 7500);
 
 			const std::string mh = USB::GetConfigString(si, port, TypeName(), "MacHex", "");
 			if (mh.size() >= 12)
@@ -727,7 +451,24 @@ namespace usb_uepcb
 				s->mac[4] = static_cast<u8>((r >> 8) & 0xFF);
 				s->mac[5] = static_cast<u8>((r >> 16) & 0xFF);
 			}
+
+			// 初始化 UDP Broadcast Socket
+			s->udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+			if (s->udp_sock != UEPCB_INVALID_SOCKET)
+			{
+				int one = 1;
+				setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
+				setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
+
+				sockaddr_in bind_addr{};
+				bind_addr.sin_family = AF_INET;
+				bind_addr.sin_port = htons(static_cast<u16>(s->udp_port));
+				bind_addr.sin_addr.s_addr = INADDR_ANY;
+
+				bind(s->udp_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr));
+			}
 		}
+
 		s->dev.speed = USB_SPEED_FULL;
 		s->desc.full = &s->desc_dev;
 		s->desc.str = uepcb_strings;
@@ -748,7 +489,7 @@ namespace usb_uepcb
 		usb_desc_init(&s->dev);
 		usb_ep_init(&s->dev);
 		uepcb_handle_reset(&s->dev);
-		s->peer_thread = std::thread(peer_thread_main, s);
+		s->recv_thread = std::thread(udp_recv_loop, s);
 		return &s->dev;
 
 	fail:
@@ -756,7 +497,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade net v2.8 Fast Poll)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade UDP P2P Mesh v2.9)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -773,22 +514,15 @@ namespace usb_uepcb
 	{
 		static const SettingInfo settings[] = {
 			{.type = SettingInfo::Type::String,
-				.name = "PeerIP",
-				.display_name = "1P's IP (same value on every PC)",
-				.description = "Cross-PC: enter the 1P's LAN IP here on EVERY PC (same value). "
-							   "The PC whose own IP matches auto-becomes 1P (listens); the rest (2P-4P) connect. "
-							   "Same-PC: leave blank on 1P, 127.0.0.1 on the others.",
-				.default_value = ""},
-			{.type = SettingInfo::Type::String,
-				.name = "BindIP",
-				.display_name = "Bind IP (1P listen)",
-				.description = "1P listen address. 0.0.0.0 = all adapters (LAN/VPN); "
-							   "127.0.0.1 = same PC only. Ignored on 2P-4P.",
-				.default_value = "0.0.0.0"},
+				.name = "TargetIP",
+				.display_name = "Target Broadcast / Subnet IP",
+				.description = "LAN Direct: set to 255.255.255.255 (or LAN Subnet Broadcast e.g. 192.168.1.255).\n"
+							   "VPN/ZeroTier: enter the Broadcast IP of your virtual adapter.",
+				.default_value = "255.255.255.255"},
 			{.type = SettingInfo::Type::Integer,
 				.name = "Port",
-				.display_name = "TCP Port",
-				.description = "TCP port for the peer link (1P opens it and adds a firewall rule automatically).",
+				.display_name = "UDP Port",
+				.description = "UDP port for mesh communication (Same port on all 4 PCs).",
 				.default_value = "7500",
 				.min_value = "1",
 				.max_value = "65535",
@@ -796,8 +530,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::String,
 				.name = "MacHex",
 				.display_name = "MAC 12-hex (optional override)",
-				.description = "Leave BLANK - each emu auto-picks a unique MAC (00902e + random). "
-							   "Only set this (12 hex) if you need a fixed MAC.",
+				.description = "Leave BLANK - auto generates unique MAC per emulator.",
 				.default_value = ""}};
 		return settings;
 	}
