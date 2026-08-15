@@ -82,6 +82,14 @@ namespace usb_uepcb
 		bool init_done = false;
 		bool link_event_sent = false;
 
+		// AN986.IRX uses asynchronous BulkTransfer callbacks plus IOP event
+		// flags (WaitEventFlag/SetEventFlag) for RX/TX completion. The
+		// emulator does not expose the real USB callback/event machinery to
+		// the IRX, so keep equivalent pending state internally. This avoids
+		// inventing a new network protocol or waiting for other machines.
+		std::atomic<u32> rx_event_pending{0};
+		std::atomic<u32> tx_event_pending{0};
+
 		std::mutex in_lock;
 		std::deque<std::vector<u8>> in_q;
 
@@ -222,6 +230,7 @@ namespace usb_uepcb
 					// expose an unbounded batch directly to the emulated NIC.
 					if (s->pending_rx.size() < 64)
 						s->pending_rx.push_back(to_bulkin(buf, n));
+						s->rx_event_pending.fetch_add(1, std::memory_order_release);
 				}
 			}
 		}
@@ -239,6 +248,7 @@ namespace usb_uepcb
 
 		sendto(s->udp_sock, reinterpret_cast<const char*>(eth), len, 0,
 			reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+		s->tx_event_pending.fetch_add(1, std::memory_order_release);
 	}
 
 	static void uepcb_handle_reset(USBDevice* dev)
@@ -334,10 +344,23 @@ namespace usb_uepcb
 			}
 		}
 
+		// AN986.IRX references sceUsbdBulkTransfer for both RX and TX; it does
+		// not reference an interrupt-transfer API. EP3 therefore remains a
+		// descriptor-compatible endpoint, but is not used as the RX delivery
+		// path here. Keep EP1/EP2 behavior unchanged.
+		const u8 ep = p->ep ? p->ep->nr : 0;
+
 		switch (p->pid)
 		{
 			case USB_TOKEN_OUT:
 			{
+				if (ep != 2)
+				{ p->status = USB_RET_STALL; break; }
+				// The real AN986 driver receives TX completion asynchronously.
+				// Consume the previous completion here rather than making the
+				// emulated game wait on a host socket operation.
+				if (s->tx_event_pending.load(std::memory_order_acquire) != 0)
+					s->tx_event_pending.fetch_sub(1, std::memory_order_acq_rel);
 				u8 pkt[2048];
 				int np = std::min<int>(p->buffer_size, (int)sizeof(pkt));
 				usb_packet_copy(p, pkt, np);
@@ -367,6 +390,16 @@ namespace usb_uepcb
 			}
 			case USB_TOKEN_IN:
 			{
+				if (ep == 3)
+				{
+					// No sceUsbdInterruptTransfer import is present in AN986.IRX.
+					// Returning NAK is closer to the driver's actual usage than
+					// fabricating an interrupt status packet.
+					p->status = USB_RET_NAK;
+					break;
+				}
+				if (ep != 1)
+				{ p->status = USB_RET_STALL; break; }
 				// Promote a bounded batch only when the emulated USB controller
 				// actually polls the IN endpoint. No peer is waited for and no
 				// artificial delay is introduced.
@@ -378,6 +411,7 @@ namespace usb_uepcb
 					{
 						s->in_q.push_back(std::move(s->pending_rx.front()));
 						s->pending_rx.pop_front();
+						s->rx_event_pending.fetch_sub(1, std::memory_order_acq_rel);
 						++moved;
 					}
 				}
