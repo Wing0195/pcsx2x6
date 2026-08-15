@@ -65,6 +65,12 @@ namespace usb_uepcb
 		u8 eeprom_word = 0;
 		std::vector<u8> tx_accum;
 
+		// UDP receive thread writes to pending_rx. The USB IN handler promotes
+		// a small bounded batch at the USB polling boundary. This keeps network
+		// scheduling from directly changing the game-visible RX queue timing.
+		std::deque<std::vector<u8>> pending_rx;
+		std::mutex pending_lock;
+
 		std::vector<u8> rx_partial;
 		size_t rx_offset = 0;
 
@@ -211,12 +217,11 @@ namespace usb_uepcb
 				// 防自我環回（Filter Out Self Packets by MAC）
 				if (std::memcmp(buf + 6, s->mac, 6) != 0)
 				{
-					std::lock_guard<std::mutex> lk(s->in_lock);
-					// 保留適當的 Queue 深度，避免 PS2 sceInet 記憶體爆掉
-					if (s->in_q.size() < 64)
-					{
-						s->in_q.push_back(to_bulkin(buf, n));
-					}
+					std::lock_guard<std::mutex> lk(s->pending_lock);
+					// Keep a bounded pending queue so a scheduler burst cannot
+					// expose an unbounded batch directly to the emulated NIC.
+					if (s->pending_rx.size() < 64)
+						s->pending_rx.push_back(to_bulkin(buf, n));
 				}
 			}
 		}
@@ -362,6 +367,20 @@ namespace usb_uepcb
 			}
 			case USB_TOKEN_IN:
 			{
+				// Promote a bounded batch only when the emulated USB controller
+				// actually polls the IN endpoint. No peer is waited for and no
+				// artificial delay is introduced.
+				{
+					std::lock_guard<std::mutex> lk(s->pending_lock);
+					std::lock_guard<std::mutex> qlk(s->in_lock);
+					int moved = 0;
+					while (!s->pending_rx.empty() && s->in_q.size() < 64 && moved < 4)
+					{
+						s->in_q.push_back(std::move(s->pending_rx.front()));
+						s->pending_rx.pop_front();
+						++moved;
+					}
+				}
 				if (!s->rx_partial.empty())
 				{
 					const int remain = static_cast<int>(s->rx_partial.size() - s->rx_offset);
