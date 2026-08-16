@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <algorithm>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -55,6 +56,17 @@ namespace usb_uepcb
 	static const char* uepcb_strings[] = {
 		"", "Namco", "UE PCB v2.9 (UDP Mesh Engine)", ""};
 
+	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
+	// frame. This is purely an emulator-side addition (real UE PCB hardware
+	// never sees this - it only exists between PCSX2 instances), so it is
+	// safe to change the wire format freely. It lets us detect drops /
+	// reordering per-peer without touching the AN986 driver protocol at all.
+	struct WireTrailer
+	{
+		u32 seq;
+	};
+	static constexpr int kWireTrailerSize = sizeof(u32);
+
 	typedef struct UePcbState
 	{
 		USBDevice dev{};
@@ -82,16 +94,18 @@ namespace usb_uepcb
 		bool init_done = false;
 		bool link_event_sent = false;
 
-		// AN986.IRX uses asynchronous BulkTransfer callbacks plus IOP event
-		// flags (WaitEventFlag/SetEventFlag) for RX/TX completion. The
-		// emulator does not expose the real USB callback/event machinery to
-		// the IRX, so keep equivalent pending state internally. This avoids
-		// inventing a new network protocol or waiting for other machines.
-		std::atomic<u32> rx_event_pending{0};
-		std::atomic<u32> tx_event_pending{0};
-
 		std::mutex in_lock;
 		std::deque<std::vector<u8>> in_q;
+
+		// Outgoing sequence counter, one per this instance. Peers use it to
+		// detect gaps in what they receive *from us*.
+		std::atomic<u32> tx_seq{0};
+
+		// Per-peer (keyed by source MAC) last-seen sequence number, used only
+		// for loss/reorder diagnostics on the receive side. Accessed only from
+		// the recv thread, so no locking needed.
+		std::unordered_map<u64, u32> peer_last_seq;
+		u32 loss_log_suppress = 0;
 
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
 		std::thread recv_thread;
@@ -206,6 +220,14 @@ namespace usb_uepcb
 		return v;
 	}
 
+	static u64 mac_key(const u8* mac)
+	{
+		u64 k = 0;
+		for (int i = 0; i < 6; i++)
+			k = (k << 8) | mac[i];
+		return k;
+	}
+
 	static void udp_recv_loop(UePcbState* s)
 	{
 		u8 buf[2048];
@@ -220,18 +242,61 @@ namespace usb_uepcb
 			int n = recvfrom(s->udp_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
 				reinterpret_cast<sockaddr*>(&src_addr), &addr_len);
 
-			if (n >= 14)
+			// recvfrom() returns a negative value both on real errors and when
+			// the socket is closed from uepcb_handle_destroy() to unblock this
+			// thread. Previously a negative n fell through the `n >= 14` check
+			// silently, which is correct, but nothing stopped the loop from
+			// spinning if the OS ever returned 0/negative without the socket
+			// actually being closed (e.g. a transient WSAECONNRESET on Windows
+			// caused by an ICMP port-unreachable from a peer that isn't up
+			// yet). Bail immediately once thread_stop is set, and otherwise
+			// just skip the malformed datagram instead of touching buf.
+			if (s->thread_stop)
+				break;
+			if (n < (int)(14 + kWireTrailerSize))
+				continue;
+
+			const int ethlen = n - kWireTrailerSize;
+
+			// 防自我環回（Filter Out Self Packets by MAC）
+			if (std::memcmp(buf + 6, s->mac, 6) == 0)
+				continue;
+
+			u32 seq = 0;
+			std::memcpy(&seq, buf + ethlen, sizeof(seq));
+
+			const u64 key = mac_key(buf + 6);
+			auto it = s->peer_last_seq.find(key);
+			if (it != s->peer_last_seq.end())
 			{
-				// 防自我環回（Filter Out Self Packets by MAC）
-				if (std::memcmp(buf + 6, s->mac, 6) != 0)
+				const u32 expected = it->second + 1;
+				if (seq != expected && s->loss_log_suppress == 0)
 				{
-					std::lock_guard<std::mutex> lk(s->pending_lock);
-					// Keep a bounded pending queue so a scheduler burst cannot
-					// expose an unbounded batch directly to the emulated NIC.
-					if (s->pending_rx.size() < 64)
-						s->pending_rx.push_back(to_bulkin(buf, n));
-						s->rx_event_pending.fetch_add(1, std::memory_order_release);
+					const s32 delta = static_cast<s32>(seq - expected);
+					if (delta > 0)
+						Console.WriteLn("UePcb: RX gap from %02x:%02x:%02x:%02x:%02x:%02x - lost ~%d packet(s) (expected seq %u, got %u)",
+							buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], delta, expected, seq);
+					else
+						Console.WriteLn("UePcb: RX out-of-order from %02x:%02x:%02x:%02x:%02x:%02x (expected seq %u, got %u)",
+							buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], expected, seq);
+					// Rate-limit: this is diagnostic only, don't flood the log
+					// if a peer disconnects mid-match and every subsequent
+					// packet looks like a fresh gap.
+					s->loss_log_suppress = 120;
 				}
+				else if (s->loss_log_suppress > 0)
+				{
+					--s->loss_log_suppress;
+				}
+			}
+			s->peer_last_seq[key] = seq;
+
+			{
+				std::lock_guard<std::mutex> lk(s->pending_lock);
+				// Keep a bounded pending queue so a scheduler burst cannot
+				// expose an unbounded batch directly to the emulated NIC.
+				if (s->pending_rx.size() < 64)
+					s->pending_rx.push_back(to_bulkin(buf, ethlen));
 			}
 		}
 	}
@@ -240,15 +305,21 @@ namespace usb_uepcb
 	{
 		if (s->udp_sock == UEPCB_INVALID_SOCKET)
 			return;
+		if (len + kWireTrailerSize > 2048)
+			return;
+
+		u8 wire[2048];
+		std::memcpy(wire, eth, len);
+		const u32 seq = s->tx_seq.fetch_add(1, std::memory_order_relaxed);
+		std::memcpy(wire + len, &seq, sizeof(seq));
 
 		sockaddr_in dst{};
 		dst.sin_family = AF_INET;
 		dst.sin_port = htons(static_cast<u16>(s->udp_port));
 		inet_pton(AF_INET, s->broadcast_ip.c_str(), &dst.sin_addr);
 
-		sendto(s->udp_sock, reinterpret_cast<const char*>(eth), len, 0,
+		sendto(s->udp_sock, reinterpret_cast<const char*>(wire), len + kWireTrailerSize, 0,
 			reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
-		s->tx_event_pending.fetch_add(1, std::memory_order_release);
 	}
 
 	static void uepcb_handle_reset(USBDevice* dev)
@@ -344,10 +415,12 @@ namespace usb_uepcb
 			}
 		}
 
-		// AN986.IRX references sceUsbdBulkTransfer for both RX and TX; it does
-		// not reference an interrupt-transfer API. EP3 therefore remains a
-		// descriptor-compatible endpoint, but is not used as the RX delivery
-		// path here. Keep EP1/EP2 behavior unchanged.
+		// AN986.IRX only ever drives Bulk OUT on EP2 and Bulk IN on EP1; EP3 is
+		// descriptor-compatible but unused (no sceUsbdInterruptTransfer import
+		// in the driver). Reject anything else instead of silently treating an
+		// unexpected endpoint as ethernet traffic - a misrouted control/other
+		// transfer being fed into tx_accum or handed back as RX data is a
+		// plausible source of desync that has nothing to do with the network.
 		const u8 ep = p->ep ? p->ep->nr : 0;
 
 		switch (p->pid)
@@ -355,12 +428,10 @@ namespace usb_uepcb
 			case USB_TOKEN_OUT:
 			{
 				if (ep != 2)
-				{ p->status = USB_RET_STALL; break; }
-				// The real AN986 driver receives TX completion asynchronously.
-				// Consume the previous completion here rather than making the
-				// emulated game wait on a host socket operation.
-				if (s->tx_event_pending.load(std::memory_order_acquire) != 0)
-					s->tx_event_pending.fetch_sub(1, std::memory_order_acq_rel);
+				{
+					p->status = USB_RET_STALL;
+					break;
+				}
 				u8 pkt[2048];
 				int np = std::min<int>(p->buffer_size, (int)sizeof(pkt));
 				usb_packet_copy(p, pkt, np);
@@ -399,7 +470,10 @@ namespace usb_uepcb
 					break;
 				}
 				if (ep != 1)
-				{ p->status = USB_RET_STALL; break; }
+				{
+					p->status = USB_RET_STALL;
+					break;
+				}
 				// Promote a bounded batch only when the emulated USB controller
 				// actually polls the IN endpoint. No peer is waited for and no
 				// artificial delay is introduced.
@@ -411,7 +485,6 @@ namespace usb_uepcb
 					{
 						s->in_q.push_back(std::move(s->pending_rx.front()));
 						s->pending_rx.pop_front();
-						s->rx_event_pending.fetch_sub(1, std::memory_order_acq_rel);
 						++moved;
 					}
 				}
@@ -512,6 +585,16 @@ namespace usb_uepcb
 				int one = 1;
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
+
+				// Give the kernel receive buffer more headroom than the tiny OS
+				// default. This is a cheap, low-risk mitigation for the sync
+				// issue: under a burst (e.g. host briefly stalls for a frame
+				// due to a savestate/alt-tab), a small kernel buffer overflows
+				// and silently drops datagrams before udp_recv_loop() ever
+				// gets to read them - that loss is invisible to everything
+				// above this layer, including the new seq-gap logging.
+				int rcvbuf = 256 * 1024;
+				setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 
 				sockaddr_in bind_addr{};
 				bind_addr.sin_family = AF_INET;
