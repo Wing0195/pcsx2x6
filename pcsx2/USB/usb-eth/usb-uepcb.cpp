@@ -21,8 +21,8 @@
 #include <string>
 #include <thread>
 #include <algorithm>
-#include <array>
 #include <map>
+#include <array>
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -87,7 +87,7 @@ namespace usb_uepcb
 		u8 mac[6] = {0x00, 0x90, 0x2E, 0x11, 0x22, 0x33};
 		int udp_port = 7500;
 		std::string broadcast_ip;
-		std::array<std::string, 4> peer_ips{};
+		std::array<std::string, 3> peer_ips{};
 		u8 mii_phyaddr = 1;
 		u8 mii_reg = 1;
 		bool init_done = false;
@@ -97,13 +97,12 @@ namespace usb_uepcb
 		std::deque<std::vector<u8>> in_q;
 
 		// Outgoing sequence counter, one per this instance. Peers use it to
-		// order packets received *from us*.
+		// detect gaps in what they receive *from us*.
 		std::atomic<u32> tx_seq{0};
 
-		// Per-peer adaptive jitter buffers. The key is the sender MAC, so each
-		// remote emulator has its own sequence stream. This is deliberately
-		// bounded: a network problem must never turn into an ever-growing
-		// backlog and multi-second game delay.
+		// Per-peer bounded adaptive jitter buffers. Sequence numbers are used
+		// to restore order within each sender stream. The buffer is deliberately
+		// small so network trouble cannot turn into seconds of game latency.
 		struct JitterPacket
 		{
 			u32 seq = 0;
@@ -116,11 +115,11 @@ namespace usb_uepcb
 			std::map<u32, JitterPacket> packets;
 			u32 next_seq = 0;
 			bool seq_valid = false;
-			u32 target_packets = 1; // Normal path: effectively no added delay.
-			u32 stable_polls = 0;
+			u32 target_packets = 1;
+			u32 stable_deliveries = 0;
 			std::chrono::steady_clock::time_point gap_since{};
 			bool gap_active = false;
-		};
+	};
 
 		std::unordered_map<u64, PeerJitter> peer_jitter;
 		std::mutex jitter_lock;
@@ -251,18 +250,18 @@ namespace usb_uepcb
 		return k;
 	}
 
-\tstatic bool seq_before(u32 a, u32 b)
+	static bool seq_before(u32 a, u32 b)
 	{
+		// Serial-number arithmetic handles uint32 wraparound.
 		return static_cast<s32>(a - b) < 0;
 	}
 
-	// Insert a packet into the sender-specific jitter buffer. This function
-	// never waits for a missing packet and never sleeps the emulator thread.
-	static void jitter_insert(UePcbState* s, u64 key, u32 seq, std::vector<u8>&& data)
+	static void jitter_insert(UePcbState* s, u64 peer_key, u32 seq, std::vector<u8>&& data)
 	{
-		std::lock_guard<std::mutex> lk(s->jitter_lock);
-		auto& jb = s->peer_jitter[key];
 		const auto now = std::chrono::steady_clock::now();
+		std::lock_guard<std::mutex> lock(s->jitter_lock);
+
+		auto& jb = s->peer_jitter[peer_key];
 
 		if (!jb.seq_valid)
 		{
@@ -270,16 +269,10 @@ namespace usb_uepcb
 			jb.seq_valid = true;
 		}
 
-		// Old/duplicate packet. Once playback has advanced past a sequence,
-		// replaying it would feed stale Ethernet data back into the game.
-		if (seq_before(seq, jb.next_seq))
+		// Packet arrived after the playback point or is a duplicate.
+		if (seq_before(seq, jb.next_seq) || jb.packets.find(seq) != jb.packets.end())
 			return;
 
-		if (jb.packets.find(seq) != jb.packets.end())
-			return;
-
-		// A gap or reordering event is a signal to add a small amount of
-		// buffering. We do NOT stop the emulator loop.
 		if (seq != jb.next_seq)
 		{
 			if (!jb.gap_active)
@@ -287,107 +280,122 @@ namespace usb_uepcb
 				jb.gap_active = true;
 				jb.gap_since = now;
 			}
+
+			// Increase buffering only when reordering/gaps are actually observed.
 			if (jb.target_packets < kJitterMaxTarget)
 				++jb.target_packets;
-			jb.stable_polls = 0;
+
+			jb.stable_deliveries = 0;
 		}
 
-		// Hard per-peer cap. If a peer is producing packets faster than the
-		// emulator can consume them, retain the packets closest to the current
-		// playback point instead of accumulating unbounded latency.
+		// Never allow an unbounded backlog.
 		if (jb.packets.size() >= kJitterMaxPackets)
 		{
 			auto farthest = std::prev(jb.packets.end());
+
+			// Keep packets closest to the playback point.
 			if (seq_before(farthest->first, seq))
 				return;
+
 			jb.packets.erase(farthest);
 		}
 
 		jb.packets.emplace(seq, UePcbState::JitterPacket{
-			.seq = seq, .data = std::move(data), .arrival = now});
+			seq, std::move(data), now});
 	}
 
-	// Promote ready packets to the game-visible pending queue. Missing packets
-	// get a short grace period; the emulator is never hard-blocked waiting for
-	// them. If a packet arrives inside the grace period, sequence order is
-	// restored. If it truly never arrives, playback advances rather than
-	// turning the whole game into slow motion.
 	static void jitter_promote(UePcbState* s)
 	{
-		std::lock_guard<std::mutex> jlk(s->jitter_lock);
-		std::lock_guard<std::mutex> lk(s->pending_lock);
+		std::lock_guard<std::mutex> jitter_lock(s->jitter_lock);
+		std::lock_guard<std::mutex> pending_lock(s->pending_lock);
 
 		while (s->pending_rx.size() < 64)
 		{
-			u64 chosen_peer = 0;
-			UePcbState::JitterPacket* chosen = nullptr;
+			u64 selected_peer = 0;
+			u32 selected_seq = 0;
+			std::chrono::steady_clock::time_point selected_arrival{};
+			bool selected = false;
 
-			// Find the earliest ready packet among all peers. Per-peer sequence
-			// order is preserved; cross-peer ordering remains arrival-driven,
-			// matching the original UDP behavior.
-			for (auto& [key, jb] : s->peer_jitter)
+			const auto now = std::chrono::steady_clock::now();
+
+			for (auto& entry : s->peer_jitter)
 			{
+				auto& jb = entry.second;
 				if (jb.packets.empty())
 					continue;
 
-				auto it = jb.packets.find(jb.next_seq);
-				if (it != jb.packets.end())
+				auto expected = jb.packets.find(jb.next_seq);
+
+				if (expected != jb.packets.end())
 				{
-					const auto age = std::chrono::steady_clock::now() - it->second.arrival;
+					const auto age =
+						std::chrono::duration_cast<std::chrono::milliseconds>(
+							now - expected->second.arrival);
+
 					if (jb.packets.size() >= jb.target_packets || age >= kJitterGrace)
 					{
-						if (!chosen || it->second.arrival < chosen->arrival)
+						if (!selected || expected->second.arrival < selected_arrival)
 						{
-							chosen_peer = key;
-							chosen = &it->second;
+							selected = true;
+							selected_peer = entry.first;
+							selected_seq = expected->first;
+							selected_arrival = expected->second.arrival;
 						}
 					}
-					continue;
 				}
-
-				// Missing expected sequence. Do not wait indefinitely.
-				if (!jb.gap_active)
+				else
 				{
-					jb.gap_active = true;
-					jb.gap_since = std::chrono::steady_clock::now();
-				}
-
-				const auto gap_age = std::chrono::steady_clock::now() - jb.gap_since;
-				if (jb.packets.size() >= jb.target_packets || gap_age >= kJitterGrace)
-				{
-					auto first = jb.packets.begin();
-					jb.next_seq = first->first;
-					jb.gap_active = false;
-
-					if (jb.target_packets < kJitterMaxTarget)
-						++jb.target_packets;
-
-					if (!chosen || first->second.arrival < chosen->arrival)
+					// A sequence gap exists. Give the missing packet a very
+					// short grace period so normal UDP reordering can recover.
+					if (!jb.gap_active)
 					{
-						chosen_peer = key;
-						chosen = &first->second;
+						jb.gap_active = true;
+						jb.gap_since = now;
+					}
+
+					const auto gap_age =
+						std::chrono::duration_cast<std::chrono::milliseconds>(
+							now - jb.gap_since);
+
+					if (jb.packets.size() >= jb.target_packets || gap_age >= kJitterGrace)
+					{
+						// The missing packet is considered too late. Advance to
+						// the earliest packet already buffered; never block PCSX2.
+						auto first = jb.packets.begin();
+
+						if (!selected || first->second.arrival < selected_arrival)
+						{
+							selected = true;
+							selected_peer = entry.first;
+							selected_seq = first->first;
+							selected_arrival = first->second.arrival;
+						}
 					}
 				}
 			}
 
-			if (!chosen)
+			if (!selected)
 				break;
 
-			auto& jb = s->peer_jitter[chosen_peer];
-			auto it = jb.packets.find(chosen->seq);
-			if (it == jb.packets.end())
+			auto peer_it = s->peer_jitter.find(selected_peer);
+			if (peer_it == s->peer_jitter.end())
 				break;
 
-			s->pending_rx.push_back(std::move(it->second.data));
-			const u32 delivered_seq = it->first;
-			jb.packets.erase(it);
-			jb.next_seq = delivered_seq + 1;
+			auto& jb = peer_it->second;
+			auto packet_it = jb.packets.find(selected_seq);
+			if (packet_it == jb.packets.end())
+				break;
+
+			s->pending_rx.push_back(std::move(packet_it->second.data));
+			jb.packets.erase(packet_it);
+			jb.next_seq = selected_seq + 1;
 			jb.gap_active = false;
 
-			if (++jb.stable_polls >= 120 && jb.target_packets > kJitterMinTarget)
+			if (++jb.stable_deliveries >= 120)
 			{
-				--jb.target_packets;
-				jb.stable_polls = 0;
+				jb.stable_deliveries = 0;
+				if (jb.target_packets > kJitterMinTarget)
+					--jb.target_packets;
 			}
 		}
 	}
@@ -395,6 +403,7 @@ namespace usb_uepcb
 	static void udp_recv_loop(UePcbState* s)
 	{
 		u8 buf[2048];
+
 		while (!s->thread_stop)
 		{
 			sockaddr_in src_addr{};
@@ -403,53 +412,54 @@ namespace usb_uepcb
 #else
 			socklen_t addr_len = sizeof(src_addr);
 #endif
-			int n = recvfrom(s->udp_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+
+			const int n = recvfrom(
+				s->udp_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
 				reinterpret_cast<sockaddr*>(&src_addr), &addr_len);
 
 			if (s->thread_stop)
 				break;
+
 			if (n < static_cast<int>(14 + kWireTrailerSize))
 				continue;
 
 			const int ethlen = n - kWireTrailerSize;
+
+			// Ignore our own Ethernet source MAC.
 			if (std::memcmp(buf + 6, s->mac, 6) == 0)
 				continue;
 
 			u32 seq = 0;
 			std::memcpy(&seq, buf + ethlen, sizeof(seq));
 
-			const u64 key = mac_key(buf + 6);
+			const u64 peer_key = mac_key(buf + 6);
 
+			// Diagnostics only. They do not stall the receiver or emulator.
 			{
-				std::lock_guard<std::mutex> jlk(s->jitter_lock);
-				auto& jb = s->peer_jitter[key];
+				std::lock_guard<std::mutex> lock(s->jitter_lock);
+				auto& jb = s->peer_jitter[peer_key];
 
 				if (jb.seq_valid)
 				{
 					const s32 delta = static_cast<s32>(seq - jb.next_seq);
-					if (delta < 0)
+
+					if (delta > 0 && s->loss_log_suppress == 0)
 					{
-						if (s->loss_log_suppress == 0)
-						{
-							Console.WriteLn(
-								"UePcb: RX late/duplicate from %02x:%02x:%02x:%02x:%02x:%02x "
-								"(next seq %u, got %u)",
-								buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-								jb.next_seq, seq);
-							s->loss_log_suppress = 120;
-						}
+						Console.WriteLn(
+							"UePcb: RX jitter/gap from %02x:%02x:%02x:%02x:%02x:%02x "
+							"(expected seq %u, got %u, target buffer %u)",
+							buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+							jb.next_seq, seq, jb.target_packets);
+						s->loss_log_suppress = 120;
 					}
-					else if (delta > 0)
+					else if (delta < 0 && s->loss_log_suppress == 0)
 					{
-						if (s->loss_log_suppress == 0)
-						{
-							Console.WriteLn(
-								"UePcb: RX jitter/gap from %02x:%02x:%02x:%02x:%02x:%02x "
-								"(next seq %u, got %u) - adaptive buffer %u",
-								buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-								jb.next_seq, seq, jb.target_packets);
-							s->loss_log_suppress = 120;
-						}
+						Console.WriteLn(
+							"UePcb: RX late/out-of-order from %02x:%02x:%02x:%02x:%02x:%02x "
+							"(next seq %u, got %u)",
+							buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+							jb.next_seq, seq);
+						s->loss_log_suppress = 120;
 					}
 					else if (s->loss_log_suppress > 0)
 					{
@@ -458,8 +468,7 @@ namespace usb_uepcb
 				}
 			}
 
-			jitter_insert(s, key, seq, to_bulkin(buf, ethlen));
-			jitter_promote(s);
+			jitter_insert(s, peer_key, seq, to_bulkin(buf, ethlen));
 		}
 	}
 
@@ -671,12 +680,13 @@ namespace usb_uepcb
 					p->status = USB_RET_STALL;
 					break;
 				}
-				// Move only packets that are ready according to the bounded adaptive
-				// jitter buffer. This never waits for a peer.
+				// Promote a bounded batch only when the emulated USB controller
+				// actually polls the IN endpoint. No peer is waited for and no
+				// artificial delay is introduced.
+				// Adaptively reorder a small amount of UDP jitter only when the
+				// emulated USB IN endpoint is actually polled.
 				jitter_promote(s);
 
-				// Promote a bounded batch only when the emulated USB controller
-				// actually polls the IN endpoint.
 				{
 					std::lock_guard<std::mutex> lk(s->pending_lock);
 					std::lock_guard<std::mutex> qlk(s->in_lock);
@@ -838,7 +848,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP v1.2 Adaptive Jitter)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP v2.92)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -870,7 +880,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::String,
 				.name = "Peer1IP",
 				.display_name = "Direct Peer 1 IP (Public / Remote)",
-				.description = "Enter IPv4 address of one of the OTHER machines. Leave all blank for LAN broadcast. Do not enter this machine's own IP.",
+				.description = "Enter IPv4 address of one of the OTHER machines. Leave all 3 blank for LAN broadcast. Enter only OTHER machines; do not enter this machine's own IP.",
 				.default_value = ""},
 			{.type = SettingInfo::Type::String,
 				.name = "Peer2IP",
