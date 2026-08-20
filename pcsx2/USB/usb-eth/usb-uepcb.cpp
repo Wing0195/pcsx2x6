@@ -123,10 +123,6 @@ namespace usb_uepcb
 
 		std::unordered_map<u64, PeerJitter> peer_jitter;
 		std::mutex jitter_lock;
-		static constexpr size_t kJitterMaxPackets = 8;
-		static constexpr u32 kJitterMinTarget = 1;
-		static constexpr u32 kJitterMaxTarget = 4;
-		static constexpr auto kJitterGrace = std::chrono::milliseconds(3);
 		u32 loss_log_suppress = 0;
 
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
@@ -249,6 +245,13 @@ namespace usb_uepcb
 			k = (k << 8) | mac[i];
 		return k;
 	}
+
+	// Adaptive jitter buffer limits. These are namespace-scope constants
+	// because the receive/promote helper functions are outside UePcbState.
+	static constexpr size_t kJitterMaxPackets = 8;
+	static constexpr u32 kJitterMinTarget = 1;
+	static constexpr u32 kJitterMaxTarget = 4;
+	static constexpr auto kJitterGrace = std::chrono::milliseconds(3);
 
 	static bool seq_before(u32 a, u32 b)
 	{
