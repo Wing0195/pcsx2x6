@@ -17,11 +17,11 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
+#include <condition_variable>
 #include <random>
 #include <string>
 #include <thread>
 #include <algorithm>
-#include <map>
 #include <array>
 #include <unordered_map>
 
@@ -56,14 +56,10 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.2 (LAN + Direct UDP + Adaptive Jitter Buffer)", ""};
+		"", "Namco", "UE PCB v3.2 (NAT Traversal + Dynamic Sync)", ""};
 
-	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
-	// frame. This is purely an emulator-side addition (real UE PCB hardware
-	// never sees this - it only exists between PCSX2 instances), so it is
-	// safe to change the wire format freely. It lets us detect drops /
-	// reordering per-peer without touching the AN986 driver protocol at all.
 	static constexpr int kWireTrailerSize = sizeof(u32);
+	static constexpr u32 kNatHolePunchMagic = 0xFFFFFFFF; // UDP 打洞魔術字串
 
 	typedef struct UePcbState
 	{
@@ -75,9 +71,6 @@ namespace usb_uepcb
 		u8 eeprom_word = 0;
 		std::vector<u8> tx_accum;
 
-		// UDP receive thread writes to pending_rx. The USB IN handler promotes
-		// a small bounded batch at the USB polling boundary. This keeps network
-		// scheduling from directly changing the game-visible RX queue timing.
 		std::deque<std::vector<u8>> pending_rx;
 		std::mutex pending_lock;
 
@@ -94,39 +87,16 @@ namespace usb_uepcb
 		bool link_event_sent = false;
 
 		std::mutex in_lock;
+		std::condition_variable cv_rx;
 		std::deque<std::vector<u8>> in_q;
 
-		// Outgoing sequence counter, one per this instance. Peers use it to
-		// detect gaps in what they receive *from us*.
 		std::atomic<u32> tx_seq{0};
-
-		// Per-peer bounded adaptive jitter buffers. Sequence numbers are used
-		// to restore order within each sender stream. The buffer is deliberately
-		// small so network trouble cannot turn into seconds of game latency.
-		struct JitterPacket
-		{
-			u32 seq = 0;
-			std::vector<u8> data;
-			std::chrono::steady_clock::time_point arrival{};
-		};
-
-		struct PeerJitter
-		{
-			std::map<u32, JitterPacket> packets;
-			u32 next_seq = 0;
-			bool seq_valid = false;
-			u32 target_packets = 1;
-			u32 stable_deliveries = 0;
-			std::chrono::steady_clock::time_point gap_since{};
-			bool gap_active = false;
-	};
-
-		std::unordered_map<u64, PeerJitter> peer_jitter;
-		std::mutex jitter_lock;
+		std::unordered_map<u64, u32> peer_last_seq;
 		u32 loss_log_suppress = 0;
 
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
 		std::thread recv_thread;
+		std::thread keepalive_thread; // UDP 打洞心跳執行緒
 		std::atomic<bool> thread_stop{false};
 	} UePcbState;
 
@@ -246,245 +216,6 @@ namespace usb_uepcb
 		return k;
 	}
 
-	// Adaptive jitter buffer limits. These are namespace-scope constants
-	// because the receive/promote helper functions are outside UePcbState.
-	static constexpr size_t kJitterMaxPackets = 8;
-	static constexpr u32 kJitterMinTarget = 1;
-	static constexpr u32 kJitterMaxTarget = 4;
-	static constexpr auto kJitterGrace = std::chrono::milliseconds(3);
-
-	static bool seq_before(u32 a, u32 b)
-	{
-		// Serial-number arithmetic handles uint32 wraparound.
-		return static_cast<s32>(a - b) < 0;
-	}
-
-	static void jitter_insert(UePcbState* s, u64 peer_key, u32 seq, std::vector<u8>&& data)
-	{
-		const auto now = std::chrono::steady_clock::now();
-		std::lock_guard<std::mutex> lock(s->jitter_lock);
-
-		auto& jb = s->peer_jitter[peer_key];
-
-		if (!jb.seq_valid)
-		{
-			jb.next_seq = seq;
-			jb.seq_valid = true;
-		}
-
-		// Packet arrived after the playback point or is a duplicate.
-		if (seq_before(seq, jb.next_seq) || jb.packets.find(seq) != jb.packets.end())
-			return;
-
-		if (seq != jb.next_seq)
-		{
-			if (!jb.gap_active)
-			{
-				jb.gap_active = true;
-				jb.gap_since = now;
-			}
-
-			// Increase buffering only when reordering/gaps are actually observed.
-			if (jb.target_packets < kJitterMaxTarget)
-				++jb.target_packets;
-
-			jb.stable_deliveries = 0;
-		}
-
-		// Never allow an unbounded backlog.
-		if (jb.packets.size() >= kJitterMaxPackets)
-		{
-			auto farthest = std::prev(jb.packets.end());
-
-			// Keep packets closest to the playback point.
-			if (seq_before(farthest->first, seq))
-				return;
-
-			jb.packets.erase(farthest);
-		}
-
-		jb.packets.emplace(seq, UePcbState::JitterPacket{
-			seq, std::move(data), now});
-	}
-
-	static void jitter_promote(UePcbState* s)
-	{
-		std::lock_guard<std::mutex> jitter_lock(s->jitter_lock);
-		std::lock_guard<std::mutex> pending_lock(s->pending_lock);
-
-		while (s->pending_rx.size() < 64)
-		{
-			u64 selected_peer = 0;
-			u32 selected_seq = 0;
-			std::chrono::steady_clock::time_point selected_arrival{};
-			bool selected = false;
-
-			const auto now = std::chrono::steady_clock::now();
-
-			for (auto& entry : s->peer_jitter)
-			{
-				auto& jb = entry.second;
-				if (jb.packets.empty())
-					continue;
-
-				auto expected = jb.packets.find(jb.next_seq);
-
-				if (expected != jb.packets.end())
-				{
-					const auto age =
-						std::chrono::duration_cast<std::chrono::milliseconds>(
-							now - expected->second.arrival);
-
-					if (jb.packets.size() >= jb.target_packets || age >= kJitterGrace)
-					{
-						if (!selected || expected->second.arrival < selected_arrival)
-						{
-							selected = true;
-							selected_peer = entry.first;
-							selected_seq = expected->first;
-							selected_arrival = expected->second.arrival;
-						}
-					}
-				}
-				else
-				{
-					// A sequence gap exists. Give the missing packet a very
-					// short grace period so normal UDP reordering can recover.
-					if (!jb.gap_active)
-					{
-						jb.gap_active = true;
-						jb.gap_since = now;
-					}
-
-					const auto gap_age =
-						std::chrono::duration_cast<std::chrono::milliseconds>(
-							now - jb.gap_since);
-
-					if (jb.packets.size() >= jb.target_packets || gap_age >= kJitterGrace)
-					{
-						// The missing packet is considered too late. Advance to
-						// the earliest packet already buffered; never block PCSX2.
-						auto first = jb.packets.begin();
-
-						if (!selected || first->second.arrival < selected_arrival)
-						{
-							selected = true;
-							selected_peer = entry.first;
-							selected_seq = first->first;
-							selected_arrival = first->second.arrival;
-						}
-					}
-				}
-			}
-
-			if (!selected)
-				break;
-
-			auto peer_it = s->peer_jitter.find(selected_peer);
-			if (peer_it == s->peer_jitter.end())
-				break;
-
-			auto& jb = peer_it->second;
-			auto packet_it = jb.packets.find(selected_seq);
-			if (packet_it == jb.packets.end())
-				break;
-
-			s->pending_rx.push_back(std::move(packet_it->second.data));
-			jb.packets.erase(packet_it);
-			jb.next_seq = selected_seq + 1;
-			jb.gap_active = false;
-
-			if (++jb.stable_deliveries >= 120)
-			{
-				jb.stable_deliveries = 0;
-				if (jb.target_packets > kJitterMinTarget)
-					--jb.target_packets;
-			}
-		}
-	}
-
-	static void udp_recv_loop(UePcbState* s)
-	{
-		u8 buf[2048];
-
-		while (!s->thread_stop)
-		{
-			sockaddr_in src_addr{};
-#ifdef _WIN32
-			int addr_len = sizeof(src_addr);
-#else
-			socklen_t addr_len = sizeof(src_addr);
-#endif
-
-			const int n = recvfrom(
-				s->udp_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
-				reinterpret_cast<sockaddr*>(&src_addr), &addr_len);
-
-			if (s->thread_stop)
-				break;
-
-			if (n < static_cast<int>(14 + kWireTrailerSize))
-				continue;
-
-			const int ethlen = n - kWireTrailerSize;
-
-			// Ignore our own Ethernet source MAC.
-			if (std::memcmp(buf + 6, s->mac, 6) == 0)
-				continue;
-
-			u32 seq = 0;
-			std::memcpy(&seq, buf + ethlen, sizeof(seq));
-
-			const u64 peer_key = mac_key(buf + 6);
-
-			// Diagnostics only. They do not stall the receiver or emulator.
-			{
-				std::lock_guard<std::mutex> lock(s->jitter_lock);
-				auto& jb = s->peer_jitter[peer_key];
-
-				if (jb.seq_valid)
-				{
-					const s32 delta = static_cast<s32>(seq - jb.next_seq);
-
-					if (delta > 0 && s->loss_log_suppress == 0)
-					{
-						Console.WriteLn(
-							"UePcb: RX jitter/gap from %02x:%02x:%02x:%02x:%02x:%02x "
-							"(expected seq %u, got %u, target buffer %u)",
-							buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-							jb.next_seq, seq, jb.target_packets);
-						s->loss_log_suppress = 120;
-					}
-					else if (delta < 0 && s->loss_log_suppress == 0)
-					{
-						Console.WriteLn(
-							"UePcb: RX late/out-of-order from %02x:%02x:%02x:%02x:%02x:%02x "
-							"(next seq %u, got %u)",
-							buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-							jb.next_seq, seq);
-						s->loss_log_suppress = 120;
-					}
-					else if (s->loss_log_suppress > 0)
-					{
-						--s->loss_log_suppress;
-					}
-				}
-			}
-
-			jitter_insert(s, peer_key, seq, to_bulkin(buf, ethlen));
-		}
-	}
-
-	static bool has_direct_peers(const UePcbState* s)
-	{
-		for (const std::string& ip : s->peer_ips)
-		{
-			if (!ip.empty())
-				return true;
-		}
-		return false;
-	}
-
 	static void udp_send_to(UePcbState* s, const std::string& ip, const u8* wire, int wire_len)
 	{
 		if (s->udp_sock == UEPCB_INVALID_SOCKET || ip.empty())
@@ -501,17 +232,82 @@ namespace usb_uepcb
 			reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
 	}
 
+	// 背景心跳執行緒：每 1 秒發送一次 NAT 打洞封包
+	static void udp_keepalive_loop(UePcbState* s)
+	{
+		const u32 hole_punch_pkt = kNatHolePunchMagic;
+		while (!s->thread_stop)
+		{
+			for (const std::string& ip : s->peer_ips)
+			{
+				if (!ip.empty())
+				{
+					udp_send_to(s, ip, reinterpret_cast<const u8*>(&hole_punch_pkt), sizeof(hole_punch_pkt));
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+	}
+
+	static void udp_recv_loop(UePcbState* s)
+	{
+		u8 buf[2048];
+		while (!s->thread_stop)
+		{
+			sockaddr_in src_addr{};
+#ifdef _WIN32
+			int addr_len = sizeof(src_addr);
+#else
+			socklen_t addr_len = sizeof(src_addr);
+#endif
+			int n = recvfrom(s->udp_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+				reinterpret_cast<sockaddr*>(&src_addr), &addr_len);
+
+			if (s->thread_stop)
+				break;
+
+			// 攔截並過濾 NAT 打洞心跳封包 (4 Bytes = Magic)
+			if (n == sizeof(u32))
+			{
+				u32 magic = 0;
+				std::memcpy(&magic, buf, sizeof(magic));
+				if (magic == kNatHolePunchMagic)
+					continue; // 成功打洞 / 維持通訊埠，不餵給網卡
+			}
+
+			if (n < (int)(14 + kWireTrailerSize))
+				continue;
+
+			const int ethlen = n - kWireTrailerSize;
+
+			// 防自我環回 (Filter Out Self Packets by MAC)
+			if (std::memcmp(buf + 6, s->mac, 6) == 0)
+				continue;
+
+			// 推入接收佇列並即時喚醒 USB 執行緒
+			{
+				std::lock_guard<std::mutex> lk(s->pending_lock);
+				s->pending_rx.push_back(to_bulkin(buf, ethlen));
+			}
+			s->cv_rx.notify_one();
+		}
+	}
+
+	static bool has_direct_peers(const UePcbState* s)
+	{
+		for (const std::string& ip : s->peer_ips)
+		{
+			if (!ip.empty())
+				return true;
+		}
+		return false;
+	}
+
 	static void udp_send_packet(UePcbState* s, const u8* eth, int len)
 	{
-		if (s->udp_sock == UEPCB_INVALID_SOCKET)
-			return;
-		if (len + kWireTrailerSize > 2048)
+		if (s->udp_sock == UEPCB_INVALID_SOCKET || len + kWireTrailerSize > 2048)
 			return;
 
-		// Build the wire packet once (eth frame + trailing seq number) and
-		// reuse it for every destination, instead of re-touching the
-		// sequence counter per peer - all peers should see the same seq
-		// stream from us, not a separate counter each.
 		u8 wire[2048];
 		std::memcpy(wire, eth, len);
 		const u32 seq = s->tx_seq.fetch_add(1, std::memory_order_relaxed);
@@ -553,11 +349,9 @@ namespace usb_uepcb
 			{
 				an986_read_local(s, index, length, data);
 
-				// 精準模擬 EventFlag 狀態暫存器 (對應 an986.irx)
 				if (index == 0x20 && length >= 2)
 				{
-					data[0] = 0x2D; // Tx/Rx Ready
-					data[1] = 0x78; // Link Complete
+					data[0] = 0x2D; data[1] = 0x78;
 				}
 				else if (index == 0x25 && length >= 2)
 				{
@@ -565,10 +359,7 @@ namespace usb_uepcb
 				}
 				else if (index == 0x2B && length >= 4)
 				{
-					data[0] = 0x00;
-					data[1] = 0x00;
-					data[2] = 0x00;
-					data[3] = 0x60; // EventFlag: Link Up & RX Buffer Ready
+					data[0] = 0x00; data[1] = 0x00; data[2] = 0x00; data[3] = 0x60;
 				}
 				for (int i = 0; i < length; i++)
 				{
@@ -626,10 +417,6 @@ namespace usb_uepcb
 			}
 		}
 
-		// AN986.IRX only ever drives Bulk OUT on EP2 and Bulk IN on EP1; EP3 is
-		// descriptor-compatible but unused (no sceUsbdInterruptTransfer import
-		// in the driver). Reject anything else instead of silently treating an
-		// unexpected endpoint as ethernet traffic.
 		const u8 ep = p->ep ? p->ep->nr : 0;
 
 		switch (p->pid)
@@ -663,7 +450,6 @@ namespace usb_uepcb
 					std::memcpy(buf, s->tx_accum.data(), n);
 					s->tx_accum.erase(s->tx_accum.begin(), s->tx_accum.begin() + total);
 
-					// 發送 UDP 封包（廣播或直連 Peer 清單）
 					udp_send_packet(s, buf + 2, ethlen);
 				}
 				break;
@@ -672,9 +458,6 @@ namespace usb_uepcb
 			{
 				if (ep == 3)
 				{
-					// No sceUsbdInterruptTransfer import is present in
-					// AN986.IRX - NAK is closer to actual driver usage than
-					// fabricating an interrupt status packet.
 					p->status = USB_RET_NAK;
 					break;
 				}
@@ -683,24 +466,47 @@ namespace usb_uepcb
 					p->status = USB_RET_STALL;
 					break;
 				}
-				// Promote a bounded batch only when the emulated USB controller
-				// actually polls the IN endpoint. No peer is waited for and no
-				// artificial delay is introduced.
-				// Adaptively reorder a small amount of UDP jitter only when the
-				// emulated USB IN endpoint is actually polled.
-				jitter_promote(s);
 
+				// 1. 將 pending 封包推進主佇列
 				{
 					std::lock_guard<std::mutex> lk(s->pending_lock);
 					std::lock_guard<std::mutex> qlk(s->in_lock);
-					int moved = 0;
-					while (!s->pending_rx.empty() && s->in_q.size() < 64 && moved < 4)
+					while (!s->pending_rx.empty())
 					{
 						s->in_q.push_back(std::move(s->pending_rx.front()));
 						s->pending_rx.pop_front();
-						++moved;
 					}
 				}
+
+				// 2. 平滑微秒同步 (非阻塞 Wait)
+				if (s->rx_partial.empty())
+				{
+					std::unique_lock<std::mutex> lk(s->in_lock);
+					if (s->in_q.empty())
+					{
+						// 最多微秒級等待 5ms，若有 UDP 包立刻喚醒，絕不引發 Lockstep 卡死
+						s->cv_rx.wait_for(lk, std::chrono::milliseconds(5), [&]() {
+							std::lock_guard<std::mutex> plk(s->pending_lock);
+							return !s->pending_rx.empty() || !s->in_q.empty() || s->thread_stop;
+						});
+
+						std::lock_guard<std::mutex> plk(s->pending_lock);
+						while (!s->pending_rx.empty())
+						{
+							s->in_q.push_back(std::move(s->pending_rx.front()));
+							s->pending_rx.pop_front();
+						}
+					}
+
+					if (!s->in_q.empty())
+					{
+						s->rx_partial = std::move(s->in_q.front());
+						s->in_q.pop_front();
+						s->rx_offset = 0;
+					}
+				}
+
+				// 3. USB 數據拷貝
 				if (!s->rx_partial.empty())
 				{
 					const int remain = static_cast<int>(s->rx_partial.size() - s->rx_offset);
@@ -717,27 +523,7 @@ namespace usb_uepcb
 				}
 				else
 				{
-					std::lock_guard<std::mutex> lk(s->in_lock);
-					if (!s->in_q.empty())
-					{
-						s->rx_partial = std::move(s->in_q.front());
-						s->in_q.pop_front();
-						s->rx_offset = 0;
-
-						const int copyLen = std::min<int>(p->buffer_size, static_cast<int>(s->rx_partial.size()));
-						usb_packet_copy(p, s->rx_partial.data(), copyLen);
-						s->rx_offset = copyLen;
-
-						if (s->rx_offset >= s->rx_partial.size())
-						{
-							s->rx_partial.clear();
-							s->rx_offset = 0;
-						}
-					}
-					else
-					{
-						p->status = USB_RET_NAK;
-					}
+					p->status = USB_RET_NAK;
 				}
 				break;
 			}
@@ -751,6 +537,8 @@ namespace usb_uepcb
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
 		s->thread_stop = true;
+		s->cv_rx.notify_all();
+
 		if (s->udp_sock != UEPCB_INVALID_SOCKET)
 		{
 			sock_close(s->udp_sock);
@@ -758,6 +546,8 @@ namespace usb_uepcb
 		}
 		if (s->recv_thread.joinable())
 			s->recv_thread.join();
+		if (s->keepalive_thread.joinable())
+			s->keepalive_thread.join();
 		delete s;
 	}
 
@@ -804,13 +594,6 @@ namespace usb_uepcb
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
 
-				// Give the kernel receive buffer more headroom than the tiny
-				// OS default. Under a burst (host briefly stalls a frame,
-				// e.g. a hitch from disk I/O or GC), a small kernel buffer
-				// overflows and silently drops datagrams before
-				// udp_recv_loop() ever reads them - a loss that's invisible
-				// even to the new seq-gap logging above, since the packet
-				// never reaches userland at all.
 				int rcvbuf = 256 * 1024;
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 
@@ -843,7 +626,10 @@ namespace usb_uepcb
 		usb_desc_init(&s->dev);
 		usb_ep_init(&s->dev);
 		uepcb_handle_reset(&s->dev);
+
 		s->recv_thread = std::thread(udp_recv_loop, s);
+		s->keepalive_thread = std::thread(udp_keepalive_loop, s); // 啟動打洞線程
+
 		return &s->dev;
 
 	fail:
@@ -851,7 +637,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP v2.92)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP v3.2)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -883,17 +669,17 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::String,
 				.name = "Peer1IP",
 				.display_name = "Direct Peer 1 IP (Public / Remote)",
-				.description = "Enter IPv4 address of one of the OTHER machines. Leave all 3 blank for LAN broadcast. Enter only OTHER machines; do not enter this machine's own IP.",
+				.description = "Enter IPv4 address of Remote Player 1. Auto UDP Hole Punch enabled.",
 				.default_value = ""},
 			{.type = SettingInfo::Type::String,
 				.name = "Peer2IP",
 				.display_name = "Direct Peer 2 IP (Public / Remote)",
-				.description = "Enter IPv4 address of one of the OTHER machines. Leave blank if unused.",
+				.description = "Enter IPv4 address of Remote Player 2. Leave blank if unused.",
 				.default_value = ""},
 			{.type = SettingInfo::Type::String,
 				.name = "Peer3IP",
 				.display_name = "Direct Peer 3 IP (Public / Remote)",
-				.description = "Enter IPv4 address of one of the OTHER machines. Leave blank if unused.",
+				.description = "Enter IPv4 address of Remote Player 3. Leave blank if unused.",
 				.default_value = ""},
 			{.type = SettingInfo::Type::String,
 				.name = "MacHex",
