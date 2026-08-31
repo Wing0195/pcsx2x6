@@ -80,11 +80,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-<<<<<<< HEAD
 		"", "Namco", "UE PCB v1.3 (LAN + Direct UDP + Adaptive Jitter Buffer)", ""};
-=======
-		"", "Namco", "UE PCB v1.3 (Experimental Adaptive)", ""};
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 
 	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
 	// frame. This is purely an emulator-side addition (real UE PCB hardware
@@ -127,7 +123,6 @@ namespace usb_uepcb
 		// Outgoing sequence counter, one per this instance. Peers use it to
 		// detect gaps in what they receive *from us*.
 		std::atomic<u32> tx_seq{0};
-<<<<<<< HEAD
 
 		// Per-peer bounded adaptive jitter buffers. Sequence numbers are used
 		// to restore order within each sender stream. The buffer is deliberately
@@ -157,40 +152,6 @@ namespace usb_uepcb
 
 		std::unordered_map<u64, PeerJitter> peer_jitter;
 		std::mutex jitter_lock;
-=======
-
-		// Per-peer bounded adaptive jitter buffers. Sequence numbers are used
-		// to restore order within each sender stream. The buffer is deliberately
-		// small so network trouble cannot turn into seconds of game latency.
-		struct JitterPacket
-		{
-			u32 seq = 0;
-			std::vector<u8> data;
-			std::chrono::steady_clock::time_point arrival{};
-		};
-
-		struct PeerJitter
-		{
-			std::map<u32, JitterPacket> packets;
-			u32 next_seq = 0;
-			bool seq_valid = false;
-			u32 target_packets = 1;
-
-			// v1.3 Experimental Adaptive:
-			// An isolated sequence gap must not immediately increase latency.
-			// Only repeated gaps inside a short window build enough pressure to
-			// raise the target.  This prevents the buffer from sticking at 4.
-			u32 jitter_score = 0;
-			std::chrono::steady_clock::time_point last_gap{};
-			std::chrono::steady_clock::time_point last_target_change{};
-
-			std::chrono::steady_clock::time_point gap_since{};
-			bool gap_active = false;
-	};
-
-		std::unordered_map<u64, PeerJitter> peer_jitter;
-		std::mutex jitter_lock;
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 		u32 loss_log_suppress = 0;
 
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
@@ -314,7 +275,6 @@ namespace usb_uepcb
 		return k;
 	}
 
-<<<<<<< HEAD
 	// Adaptive jitter buffer limits. These are namespace-scope constants
 	// because the receive/promote helper functions are outside UePcbState.
 	static constexpr size_t kJitterMaxPackets = 8;
@@ -332,29 +292,6 @@ namespace usb_uepcb
 	static constexpr auto kJitterDecayInterval = std::chrono::milliseconds(4000);
 
 	static bool seq_before(u32 a, u32 b)
-=======
-	// Adaptive jitter buffer limits. These are namespace-scope constants
-	// because the receive/promote helper functions are outside UePcbState.
-	static constexpr size_t kJitterMaxPackets = 8;
-	static constexpr u32 kJitterMinTarget = 1;
-	static constexpr u32 kJitterMaxTarget = 4;
-	static constexpr auto kJitterGrace = std::chrono::milliseconds(3);
-
-	// v1.3 Experimental Adaptive - changes 1 + 2 only.
-	// A single isolated gap does not raise the target. Repeated gaps within
-	// this window accumulate a small pressure score.
-	static constexpr auto kJitterBurstWindow = std::chrono::milliseconds(1000);
-	static constexpr u32 kJitterScoreForTarget2 = 2;
-	static constexpr u32 kJitterScoreForTarget3 = 4;
-	static constexpr u32 kJitterScoreForTarget4 = 7;
-	static constexpr u32 kJitterScoreMax = 12;
-
-	// Once the stream is stable, lower latency one step at a time based on
-	// elapsed stable time instead of waiting for 120 packet deliveries.
-	static constexpr auto kJitterStableStepDown = std::chrono::milliseconds(750);
-
-	static bool seq_before(u32 a, u32 b)
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 	{
 		// Serial-number arithmetic handles uint32 wraparound.
 		return static_cast<s32>(a - b) < 0;
@@ -377,7 +314,6 @@ namespace usb_uepcb
 		if (seq_before(seq, jb.next_seq) || jb.packets.find(seq) != jb.packets.end())
 			return;
 
-<<<<<<< HEAD
 		// Claude UePcb 1.3: target_packets is deliberately NOT touched here
 		// anymore. A packet simply arriving out of order (seq != jb.next_seq)
 		// is the ordinary case of two adjacent UDP datagrams swapping order
@@ -406,64 +342,6 @@ namespace usb_uepcb
 
 		jb.packets.emplace(seq, UePcbState::JitterPacket{
 			seq, std::move(data), now});
-=======
-		if (seq != jb.next_seq)
-		{
-			// Count only the start of a gap episode. Several packets may arrive
-			// behind the same missing sequence; those must not each raise the score.
-			const bool new_gap_event = !jb.gap_active;
-			if (new_gap_event)
-			{
-				jb.gap_active = true;
-				jb.gap_since = now;
-
-				// v1.3 change #1: do not increase latency for one isolated gap.
-				// Gaps close together build pressure; a gap after a stable interval
-				// starts a new score from 1.
-				if (jb.last_gap.time_since_epoch().count() == 0 ||
-					now - jb.last_gap > kJitterBurstWindow)
-				{
-					jb.jitter_score = 1;
-				}
-				else if (jb.jitter_score < kJitterScoreMax)
-				{
-					++jb.jitter_score;
-				}
-				jb.last_gap = now;
-
-				u32 desired_target = kJitterMinTarget;
-				if (jb.jitter_score >= kJitterScoreForTarget4)
-					desired_target = kJitterMaxTarget;
-				else if (jb.jitter_score >= kJitterScoreForTarget3)
-					desired_target = 3;
-				else if (jb.jitter_score >= kJitterScoreForTarget2)
-					desired_target = 2;
-
-				if (desired_target > jb.target_packets)
-				{
-					// Rise one step per distinct gap episode. This deliberately avoids
-					// jumping straight from target 1 to target 4 on a brief burst.
-					++jb.target_packets;
-					jb.last_target_change = now;
-				}
-			}
-		}
-
-		// Never allow an unbounded backlog.
-		if (jb.packets.size() >= kJitterMaxPackets)
-		{
-			auto farthest = std::prev(jb.packets.end());
-
-			// Keep packets closest to the playback point.
-			if (seq_before(farthest->first, seq))
-				return;
-
-			jb.packets.erase(farthest);
-		}
-
-		jb.packets.emplace(seq, UePcbState::JitterPacket{
-			seq, std::move(data), now});
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 	}
 
 	static void jitter_promote(UePcbState* s)
@@ -473,7 +351,6 @@ namespace usb_uepcb
 
 		while (s->pending_rx.size() < 64)
 		{
-<<<<<<< HEAD
 			u64 selected_peer = 0;
 			u32 selected_seq = 0;
 			std::chrono::steady_clock::time_point selected_arrival{};
@@ -488,16 +365,6 @@ namespace usb_uepcb
 			const auto now = std::chrono::steady_clock::now();
 
 			for (auto& entry : s->peer_jitter)
-=======
-			u64 selected_peer = 0;
-			u32 selected_seq = 0;
-			std::chrono::steady_clock::time_point selected_arrival{};
-			bool selected = false;
-
-			const auto now = std::chrono::steady_clock::now();
-
-			for (auto& entry : s->peer_jitter)
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 			{
 				auto& jb = entry.second;
 				if (jb.packets.empty())
@@ -507,7 +374,6 @@ namespace usb_uepcb
 
 				if (expected != jb.packets.end())
 				{
-<<<<<<< HEAD
 					const auto age =
 						std::chrono::duration_cast<std::chrono::milliseconds>(
 							now - expected->second.arrival);
@@ -523,24 +389,7 @@ namespace usb_uepcb
 							selected_is_forced_skip = false;
 						}
 					}
-=======
-					const auto age =
-						std::chrono::duration_cast<std::chrono::milliseconds>(
-							now - expected->second.arrival);
-
-					if (jb.packets.size() >= jb.target_packets || age >= kJitterGrace)
-					{
-						if (!selected || expected->second.arrival < selected_arrival)
-						{
-							selected = true;
-							selected_peer = entry.first;
-							selected_seq = expected->first;
-							selected_arrival = expected->second.arrival;
-						}
-					}
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 				}
-<<<<<<< HEAD
 				else
 				{
 					// A sequence gap exists. Give the missing packet a very
@@ -571,39 +420,7 @@ namespace usb_uepcb
 						}
 					}
 				}
-=======
-				else
-				{
-					// A sequence gap exists. Give the missing packet a very
-					// short grace period so normal UDP reordering can recover.
-					if (!jb.gap_active)
-					{
-						jb.gap_active = true;
-						jb.gap_since = now;
-					}
-
-					const auto gap_age =
-						std::chrono::duration_cast<std::chrono::milliseconds>(
-							now - jb.gap_since);
-
-					if (jb.packets.size() >= jb.target_packets || gap_age >= kJitterGrace)
-					{
-						// The missing packet is considered too late. Advance to
-						// the earliest packet already buffered; never block PCSX2.
-						auto first = jb.packets.begin();
-
-						if (!selected || first->second.arrival < selected_arrival)
-						{
-							selected = true;
-							selected_peer = entry.first;
-							selected_seq = first->first;
-							selected_arrival = first->second.arrival;
-						}
-					}
-				}
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 			}
-<<<<<<< HEAD
 
 			if (!selected)
 				break;
@@ -660,47 +477,6 @@ namespace usb_uepcb
 						static_cast<long long>(since_change.count()));
 				}
 			}
-=======
-
-			if (!selected)
-				break;
-
-			auto peer_it = s->peer_jitter.find(selected_peer);
-			if (peer_it == s->peer_jitter.end())
-				break;
-
-			auto& jb = peer_it->second;
-			auto packet_it = jb.packets.find(selected_seq);
-			if (packet_it == jb.packets.end())
-				break;
-
-			s->pending_rx.push_back(std::move(packet_it->second.data));
-			jb.packets.erase(packet_it);
-			jb.next_seq = selected_seq + 1;
-			jb.gap_active = false;
-
-			// v1.3 change #2: time-based hysteresis.  If no new gap has been
-			// observed for a stable interval, reduce the target one step.  This
-			// lets latency recover much sooner than the old 120-delivery rule.
-			if (jb.target_packets > kJitterMinTarget &&
-				jb.last_gap.time_since_epoch().count() != 0 &&
-				now - jb.last_gap >= kJitterStableStepDown &&
-				(jb.last_target_change.time_since_epoch().count() == 0 ||
-				 now - jb.last_target_change >= kJitterStableStepDown))
-			{
-				--jb.target_packets;
-				jb.last_target_change = now;
-
-				// Reduce accumulated pressure along with the target so an old burst
-				// cannot immediately push the buffer back up after recovery.
-				if (jb.target_packets <= 1)
-					jb.jitter_score = 0;
-				else if (jb.target_packets == 2)
-					jb.jitter_score = std::min<u32>(jb.jitter_score, kJitterScoreForTarget3 - 1);
-				else if (jb.target_packets == 3)
-					jb.jitter_score = std::min<u32>(jb.jitter_score, kJitterScoreForTarget4 - 1);
-			}
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 		}
 	}
 
@@ -1152,11 +928,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-<<<<<<< HEAD
 	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - Claude UePcb 1.3)"; }
-=======
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP v1.3 Experimental Adaptive)"; }
->>>>>>> 442366b74f241143db032c12a7747a5d8422e1a5
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
