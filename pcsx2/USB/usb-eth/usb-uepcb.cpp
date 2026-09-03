@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// Claude UePcb 1.3
+// usb-uepcb1.3.1 (Experimental Adaptive)
+// Based on: Claude UePcb 1.3
+//
+// 1.3.1 changes:
+//   - Shared 10-slot Peer IP history pool with per-peer numeric selectors.
+//   - Remember/Clear actions use only SettingInfo String/Integer types for build safety.
+//   - Synchronization timing is unchanged from Claude 1.3.
+//   - Adds diagnostic counters and end-of-session summaries only.
 // Based on: usb-uepcb_fixed_udp_1_2_dynamic_buildfix.cpp
 //
 // Change from 1.2: the adaptive jitter buffer's grow/decay logic was
@@ -31,6 +38,7 @@
 #include "USB/usb-eth/usb-uepcb.h"
 #include "USB/USB.h"
 #include "common/Console.h"
+#include "common/SettingsInterface.h"
 #include "StateWrapper.h"
 #include "IopMem.h"
 
@@ -140,6 +148,15 @@ namespace usb_uepcb
 			u32 next_seq = 0;
 			bool seq_valid = false;
 			u32 target_packets = 1;
+
+			// 1.3.1 diagnostics only. These counters never affect playback timing.
+			u64 diag_rx = 0;
+			u64 diag_ahead = 0;
+			u64 diag_recovered = 0;
+			u64 diag_forced_skip = 0;
+			u64 diag_late = 0;
+			u64 diag_duplicate = 0;
+			u32 diag_max_ahead = 0;
 			// Claude UePcb 1.3: replaces the old "stable_deliveries" counter.
 			// Decay is now time-based (see kJitterDecayInterval) so a single
 			// isolated reorder can't zero out several seconds of otherwise
@@ -153,6 +170,13 @@ namespace usb_uepcb
 		std::unordered_map<u64, PeerJitter> peer_jitter;
 		std::mutex jitter_lock;
 		u32 loss_log_suppress = 0;
+
+		// 1.3.1 diagnostic: forced skips on different peers in a very short
+		// window are more suggestive of a local emulator/USB scheduling stall
+		// than independent network loss. This is logging only.
+		std::chrono::steady_clock::time_point diag_last_forced_time{};
+		u64 diag_last_forced_peer = 0;
+		bool diag_last_forced_valid = false;
 
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
 		std::thread recv_thread;
@@ -303,6 +327,7 @@ namespace usb_uepcb
 		std::lock_guard<std::mutex> lock(s->jitter_lock);
 
 		auto& jb = s->peer_jitter[peer_key];
+		++jb.diag_rx;
 
 		if (!jb.seq_valid)
 		{
@@ -311,8 +336,24 @@ namespace usb_uepcb
 		}
 
 		// Packet arrived after the playback point or is a duplicate.
-		if (seq_before(seq, jb.next_seq) || jb.packets.find(seq) != jb.packets.end())
+		if (seq_before(seq, jb.next_seq))
+		{
+			++jb.diag_late;
 			return;
+		}
+
+		if (jb.packets.find(seq) != jb.packets.end())
+		{
+			++jb.diag_duplicate;
+			return;
+		}
+
+		if (seq != jb.next_seq)
+		{
+			++jb.diag_ahead;
+			const u32 ahead = seq - jb.next_seq;
+			jb.diag_max_ahead = std::max(jb.diag_max_ahead, ahead);
+		}
 
 		// Claude UePcb 1.3: target_packets is deliberately NOT touched here
 		// anymore. A packet simply arriving out of order (seq != jb.next_seq)
@@ -361,6 +402,7 @@ namespace usb_uepcb
 			// False for the ordinary "next packet was already sitting
 			// there" case, even if it arrived slightly out of send order.
 			bool selected_is_forced_skip = false;
+			bool selected_is_recovered = false;
 
 			const auto now = std::chrono::steady_clock::now();
 
@@ -387,6 +429,7 @@ namespace usb_uepcb
 							selected_seq = expected->first;
 							selected_arrival = expected->second.arrival;
 							selected_is_forced_skip = false;
+							selected_is_recovered = jb.gap_active;
 						}
 					}
 				}
@@ -417,6 +460,7 @@ namespace usb_uepcb
 							selected_seq = first->first;
 							selected_arrival = first->second.arrival;
 							selected_is_forced_skip = true;
+							selected_is_recovered = false;
 						}
 					}
 				}
@@ -437,6 +481,8 @@ namespace usb_uepcb
 			s->pending_rx.push_back(std::move(packet_it->second.data));
 			jb.packets.erase(packet_it);
 			jb.next_seq = selected_seq + 1;
+			if (selected_is_recovered)
+				++jb.diag_recovered;
 			jb.gap_active = false;
 
 			if (!jb.last_target_change_valid)
@@ -447,6 +493,25 @@ namespace usb_uepcb
 
 			if (selected_is_forced_skip)
 			{
+				++jb.diag_forced_skip;
+
+				// Diagnostic only: multiple different peers forced-skipping within
+				// 100ms strongly resembles the same-PC 1P stall seen in test logs.
+				if (s->diag_last_forced_valid && s->diag_last_forced_peer != selected_peer)
+				{
+					const auto burst_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+						now - s->diag_last_forced_time);
+					if (burst_ms.count() >= 0 && burst_ms.count() <= 100)
+					{
+						Console.WriteLn(
+							"UePcb DIAG: possible local stall - forced skips on different peers within %lldms",
+							static_cast<long long>(burst_ms.count()));
+					}
+				}
+				s->diag_last_forced_time = now;
+				s->diag_last_forced_peer = selected_peer;
+				s->diag_last_forced_valid = true;
+
 				// Real, unresolved gap - this is the only place target_packets
 				// grows now. One step at a time, same as 1.2.
 				if (jb.target_packets < kJitterMaxTarget)
@@ -835,6 +900,27 @@ namespace usb_uepcb
 		}
 		if (s->recv_thread.joinable())
 			s->recv_thread.join();
+
+		// 1.3.1 end-of-session diagnostics. Printed only during device teardown
+		// so normal packet processing gets no periodic logging overhead.
+		{
+			std::lock_guard<std::mutex> lock(s->jitter_lock);
+			for (const auto& entry : s->peer_jitter)
+			{
+				const auto& jb = entry.second;
+				Console.WriteLn(
+					"UePcb DIAG summary peer=%llu RX=%llu Ahead=%llu Recovered=%llu ForcedSkip=%llu Late=%llu Duplicate=%llu MaxAhead=%u FinalBuffer=%u Queue=%zu",
+					static_cast<unsigned long long>(entry.first),
+					static_cast<unsigned long long>(jb.diag_rx),
+					static_cast<unsigned long long>(jb.diag_ahead),
+					static_cast<unsigned long long>(jb.diag_recovered),
+					static_cast<unsigned long long>(jb.diag_forced_skip),
+					static_cast<unsigned long long>(jb.diag_late),
+					static_cast<unsigned long long>(jb.diag_duplicate),
+					jb.diag_max_ahead, jb.target_packets, jb.packets.size());
+			}
+		}
+
 		delete s;
 	}
 
@@ -846,10 +932,92 @@ namespace usb_uepcb
 			s->broadcast_ip = USB::GetConfigString(si, port, TypeName(), "TargetIP", "255.255.255.255");
 			s->udp_port = USB::GetConfigInt(si, port, TypeName(), "Port", 7500);
 
+			// 1.3.1 shared Peer IP history. The supplied branch only demonstrates
+			// SettingInfo String/Integer fields, so this uses numeric selectors
+			// rather than relying on an unverified ComboBox/Button enum type.
+			static constexpr int kHistorySlots = 10;
+			std::array<std::string, kHistorySlots> history{};
+			for (int i = 0; i < kHistorySlots; ++i)
+			{
+				const std::string key = "History" + std::to_string(i + 1);
+				history[i] = USB::GetConfigString(si, port, TypeName(), key.c_str(), "");
+			}
+
+			const std::string config_section = "USB" + std::to_string(port + 1);
+			const auto real_key = [this](const std::string& key) {
+				return std::string(TypeName()) + "_" + key;
+			};
+
+			const bool clear_history =
+				(USB::GetConfigInt(si, port, TypeName(), "ClearIPHistory", 0) != 0);
+			if (clear_history)
+			{
+				for (int i = 0; i < kHistorySlots; ++i)
+				{
+					history[i].clear();
+					const std::string key = "History" + std::to_string(i + 1);
+					si.SetStringValue(config_section.c_str(), real_key(key).c_str(), "");
+				}
+				for (int i = 0; i < 3; ++i)
+				{
+					const std::string key = "Peer" + std::to_string(i + 1) + "HistorySlot";
+					si.SetUIntValue(config_section.c_str(), real_key(key).c_str(), 0);
+				}
+				si.SetUIntValue(config_section.c_str(), real_key("ClearIPHistory").c_str(), 0);
+				Console.WriteLn("UePcb: shared Peer IP history cleared");
+			}
+
+			std::array<std::string, 3> manual_peer_ips{};
 			for (int i = 0; i < 3; ++i)
 			{
-				const std::string key = "Peer" + std::to_string(i + 1) + "IP";
-				s->peer_ips[i] = USB::GetConfigString(si, port, TypeName(), key.c_str(), "");
+				const std::string ip_key = "Peer" + std::to_string(i + 1) + "IP";
+				manual_peer_ips[i] = USB::GetConfigString(si, port, TypeName(), ip_key.c_str(), "");
+				s->peer_ips[i] = manual_peer_ips[i];
+
+				const std::string slot_key = "Peer" + std::to_string(i + 1) + "HistorySlot";
+				const int slot = USB::GetConfigInt(si, port, TypeName(), slot_key.c_str(), 0);
+				if (slot >= 1 && slot <= kHistorySlots && !history[slot - 1].empty())
+					s->peer_ips[i] = history[slot - 1];
+			}
+
+			const bool remember_history =
+				(USB::GetConfigInt(si, port, TypeName(), "RememberCurrentIPs", 0) != 0);
+			if (remember_history && !clear_history)
+			{
+				std::array<std::string, kHistorySlots> updated{};
+				int used = 0;
+
+				const auto add_unique = [&](const std::string& ip) {
+					if (ip.empty() || used >= kHistorySlots)
+						return;
+					for (int j = 0; j < used; ++j)
+					{
+						if (updated[j] == ip)
+							return;
+					}
+					updated[used++] = ip;
+				};
+
+				// Current resolved Peer IPs become the MRU entries.
+				for (const std::string& ip : s->peer_ips)
+					add_unique(ip);
+				for (const std::string& ip : history)
+					add_unique(ip);
+
+				history = updated;
+				for (int i = 0; i < kHistorySlots; ++i)
+				{
+					const std::string key = "History" + std::to_string(i + 1);
+					si.SetStringValue(config_section.c_str(), real_key(key).c_str(), history[i].c_str());
+				}
+				si.SetUIntValue(config_section.c_str(), real_key("RememberCurrentIPs").c_str(), 0);
+				Console.WriteLn("UePcb: remembered current Peer IPs into shared history");
+			}
+
+			for (int i = 0; i < 3; ++i)
+			{
+				Console.WriteLn("UePcb: Peer%d resolved IP = %s", i + 1,
+					s->peer_ips[i].empty() ? "<empty>" : s->peer_ips[i].c_str());
 			}
 
 			const std::string mh = USB::GetConfigString(si, port, TypeName(), "MacHex", "");
@@ -928,7 +1096,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - Claude UePcb 1.3)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - 1.3.1 Experimental Adaptive)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -957,21 +1125,62 @@ namespace usb_uepcb
 				.min_value = "1",
 				.max_value = "65535",
 				.step_value = "1"},
+
 			{.type = SettingInfo::Type::String,
 				.name = "Peer1IP",
-				.display_name = "Direct Peer 1 IP (Public / Remote)",
-				.description = "Enter IPv4 address of one of the OTHER machines. Leave all 3 blank for LAN broadcast. Enter only OTHER machines; do not enter this machine's own IP.",
+				.display_name = "Direct Peer 1 IP (Manual)",
+				.description = "Manual IPv4 address. Used when Peer 1 History Slot is 0.",
 				.default_value = ""},
+			{.type = SettingInfo::Type::Integer,
+				.name = "Peer1HistorySlot",
+				.display_name = "Peer 1 History Slot (0=Manual, 1-10=Saved)",
+				.description = "Select a shared saved IP. 0 uses Direct Peer 1 IP above.",
+				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+
 			{.type = SettingInfo::Type::String,
 				.name = "Peer2IP",
-				.display_name = "Direct Peer 2 IP (Public / Remote)",
-				.description = "Enter IPv4 address of one of the OTHER machines. Leave blank if unused.",
+				.display_name = "Direct Peer 2 IP (Manual)",
+				.description = "Manual IPv4 address. Used when Peer 2 History Slot is 0.",
 				.default_value = ""},
+			{.type = SettingInfo::Type::Integer,
+				.name = "Peer2HistorySlot",
+				.display_name = "Peer 2 History Slot (0=Manual, 1-10=Saved)",
+				.description = "Select the same shared history pool as Peer 1.",
+				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+
 			{.type = SettingInfo::Type::String,
 				.name = "Peer3IP",
-				.display_name = "Direct Peer 3 IP (Public / Remote)",
-				.description = "Enter IPv4 address of one of the OTHER machines. Leave blank if unused.",
+				.display_name = "Direct Peer 3 IP (Manual)",
+				.description = "Manual IPv4 address. Used when Peer 3 History Slot is 0.",
 				.default_value = ""},
+			{.type = SettingInfo::Type::Integer,
+				.name = "Peer3HistorySlot",
+				.display_name = "Peer 3 History Slot (0=Manual, 1-10=Saved)",
+				.description = "Select the same shared history pool as Peer 1 and Peer 2.",
+				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+
+			{.type = SettingInfo::Type::Integer,
+				.name = "RememberCurrentIPs",
+				.display_name = "Remember Current Peer IPs (set 1, then Apply)",
+				.description = "Set to 1 and Apply. Current resolved Peer1-3 IPs are moved to the front of the shared 10-entry history, duplicates removed; it resets to 0 automatically.",
+				.default_value = "0", .min_value = "0", .max_value = "1", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer,
+				.name = "ClearIPHistory",
+				.display_name = "Clear Shared IP History (set 1, then Apply)",
+				.description = "Set to 1 and Apply to clear all 10 saved IPs and reset Peer history selectors to Manual. It resets to 0 automatically.",
+				.default_value = "0", .min_value = "0", .max_value = "1", .step_value = "1"},
+
+			{.type = SettingInfo::Type::String, .name = "History1", .display_name = "Saved IP 1 (Newest)", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History2", .display_name = "Saved IP 2", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History3", .display_name = "Saved IP 3", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History4", .display_name = "Saved IP 4", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History5", .display_name = "Saved IP 5", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History6", .display_name = "Saved IP 6", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History7", .display_name = "Saved IP 7", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History8", .display_name = "Saved IP 8", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History9", .display_name = "Saved IP 9", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History10", .display_name = "Saved IP 10 (Oldest)", .description = "Shared Peer IP history entry.", .default_value = ""},
+
 			{.type = SettingInfo::Type::String,
 				.name = "MacHex",
 				.display_name = "MAC 12-hex (optional override)",
@@ -979,4 +1188,5 @@ namespace usb_uepcb
 				.default_value = ""}};
 		return settings;
 	}
+
 } // namespace usb_uepcb
