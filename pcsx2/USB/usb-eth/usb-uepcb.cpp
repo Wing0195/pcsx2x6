@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.3.1 (Experimental Adaptive)
+// usb-uepcb1.3.2 (Experimental Adaptive)
 // Based on: Claude UePcb 1.3
 //
-// 1.3.1 changes:
-//   - Shared 10-slot Peer IP history pool with per-peer numeric selectors.
-//   - Remember/Clear actions use only SettingInfo String/Integer types for build safety.
-//   - Synchronization timing is unchanged from Claude 1.3.
-//   - Adds diagnostic counters and end-of-session summaries only.
+// 1.3.2 changes:
+//   - Keeps the 1.3.1 shared 10-slot Peer IP history pool.
+//   - Remember/Clear are native Boolean checkbox settings.
+//   - Grace/Decay/MinTarget/MaxTarget/MaxQueue are user-adjustable settings.
+//   - Defaults reproduce Claude 1.3/1.3.1 synchronization timing.
+//   - Recovered diagnostic now counts ahead-arriving packets later promoted in order.
 // Based on: usb-uepcb_fixed_udp_1_2_dynamic_buildfix.cpp
 //
 // Change from 1.2: the adaptive jitter buffer's grow/decay logic was
@@ -28,7 +29,7 @@
 //      missing packet's grace period genuinely expires (i.e. growing the
 //      buffer would actually have helped) - not the instant a reorder is
 //      first observed in jitter_insert().
-//   2) Decay is time-based (kJitterDecayInterval since the last forced
+//   2) Decay is time-based (configured interval since the last forced
 //      skip) instead of a consecutive-success counter, so one isolated
 //      hiccup no longer wipes out an otherwise-clean multi-minute streak.
 
@@ -140,6 +141,8 @@ namespace usb_uepcb
 			u32 seq = 0;
 			std::vector<u8> data;
 			std::chrono::steady_clock::time_point arrival{};
+			// Diagnostic only: packet arrived ahead of the then-current playback point.
+			bool diag_was_ahead = false;
 		};
 
 		struct PeerJitter
@@ -149,7 +152,7 @@ namespace usb_uepcb
 			bool seq_valid = false;
 			u32 target_packets = 1;
 
-			// 1.3.1 diagnostics only. These counters never affect playback timing.
+			// 1.3.2 diagnostics only. These counters never affect playback timing.
 			u64 diag_rx = 0;
 			u64 diag_ahead = 0;
 			u64 diag_recovered = 0;
@@ -158,7 +161,7 @@ namespace usb_uepcb
 			u64 diag_duplicate = 0;
 			u32 diag_max_ahead = 0;
 			// Claude UePcb 1.3: replaces the old "stable_deliveries" counter.
-			// Decay is now time-based (see kJitterDecayInterval) so a single
+			// Decay is now time-based (see jitter_decay_interval) so a single
 			// isolated reorder can't zero out several seconds of otherwise
 			// clean delivery and re-arm a long climb back to the max.
 			std::chrono::steady_clock::time_point last_target_change{};
@@ -171,12 +174,20 @@ namespace usb_uepcb
 		std::mutex jitter_lock;
 		u32 loss_log_suppress = 0;
 
-		// 1.3.1 diagnostic: forced skips on different peers in a very short
+		// 1.3.2 diagnostic: forced skips on different peers in a very short
 		// window are more suggestive of a local emulator/USB scheduling stall
 		// than independent network loss. This is logging only.
 		std::chrono::steady_clock::time_point diag_last_forced_time{};
 		u64 diag_last_forced_peer = 0;
 		bool diag_last_forced_valid = false;
+
+		// 1.3.2 user-tunable adaptive jitter parameters. Defaults reproduce
+		// Claude 1.3/1.3.1 behavior exactly. Values are clamped on load.
+		size_t jitter_max_packets = 8;
+		u32 jitter_min_target = 1;
+		u32 jitter_max_target = 4;
+		std::chrono::milliseconds jitter_grace{3};
+		std::chrono::milliseconds jitter_decay_interval{4000};
 
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
 		std::thread recv_thread;
@@ -299,21 +310,9 @@ namespace usb_uepcb
 		return k;
 	}
 
-	// Adaptive jitter buffer limits. These are namespace-scope constants
-	// because the receive/promote helper functions are outside UePcbState.
-	static constexpr size_t kJitterMaxPackets = 8;
-	static constexpr u32 kJitterMinTarget = 1;
-	static constexpr u32 kJitterMaxTarget = 4;
-	static constexpr auto kJitterGrace = std::chrono::milliseconds(3);
-	// Claude UePcb 1.3: minimum time since the last forced skip (real,
-	// unresolved packet loss/lateness) before we relax target_packets by
-	// one step. Test logs showed harmless reorder events recurring roughly
-	// every 4-5 seconds on average; this is intentionally in that same
-	// ballpark so a single stray event doesn't restart a long climb, while
-	// genuinely calm stretches still get the buffer back down reasonably
-	// quickly. Tune this first if 1.3 still feels sticky at max, or decays
-	// too eagerly right before a genuine burst.
-	static constexpr auto kJitterDecayInterval = std::chrono::milliseconds(4000);
+	// Adaptive jitter parameters are stored per UePcbState in 1.3.2 so they
+	// can be tuned from the USB settings UI without recompiling. Defaults
+	// remain Grace=3ms, Decay=4000ms, MinTarget=1, MaxTarget=4, Queue=8.
 
 	static bool seq_before(u32 a, u32 b)
 	{
@@ -332,6 +331,7 @@ namespace usb_uepcb
 		if (!jb.seq_valid)
 		{
 			jb.next_seq = seq;
+			jb.target_packets = s->jitter_min_target;
 			jb.seq_valid = true;
 		}
 
@@ -348,7 +348,8 @@ namespace usb_uepcb
 			return;
 		}
 
-		if (seq != jb.next_seq)
+		const bool diag_was_ahead = (seq != jb.next_seq);
+		if (diag_was_ahead)
 		{
 			++jb.diag_ahead;
 			const u32 ahead = seq - jb.next_seq;
@@ -370,7 +371,7 @@ namespace usb_uepcb
 		// for that countdown), so they're not touched here either.
 
 		// Never allow an unbounded backlog.
-		if (jb.packets.size() >= kJitterMaxPackets)
+		if (jb.packets.size() >= s->jitter_max_packets)
 		{
 			auto farthest = std::prev(jb.packets.end());
 
@@ -382,7 +383,7 @@ namespace usb_uepcb
 		}
 
 		jb.packets.emplace(seq, UePcbState::JitterPacket{
-			seq, std::move(data), now});
+			seq, std::move(data), now, diag_was_ahead});
 	}
 
 	static void jitter_promote(UePcbState* s)
@@ -402,7 +403,6 @@ namespace usb_uepcb
 			// False for the ordinary "next packet was already sitting
 			// there" case, even if it arrived slightly out of send order.
 			bool selected_is_forced_skip = false;
-			bool selected_is_recovered = false;
 
 			const auto now = std::chrono::steady_clock::now();
 
@@ -420,7 +420,7 @@ namespace usb_uepcb
 						std::chrono::duration_cast<std::chrono::milliseconds>(
 							now - expected->second.arrival);
 
-					if (jb.packets.size() >= jb.target_packets || age >= kJitterGrace)
+					if (jb.packets.size() >= jb.target_packets || age >= s->jitter_grace)
 					{
 						if (!selected || expected->second.arrival < selected_arrival)
 						{
@@ -429,7 +429,6 @@ namespace usb_uepcb
 							selected_seq = expected->first;
 							selected_arrival = expected->second.arrival;
 							selected_is_forced_skip = false;
-							selected_is_recovered = jb.gap_active;
 						}
 					}
 				}
@@ -447,7 +446,7 @@ namespace usb_uepcb
 						std::chrono::duration_cast<std::chrono::milliseconds>(
 							now - jb.gap_since);
 
-					if (jb.packets.size() >= jb.target_packets || gap_age >= kJitterGrace)
+					if (jb.packets.size() >= jb.target_packets || gap_age >= s->jitter_grace)
 					{
 						// The missing packet is considered too late. Advance to
 						// the earliest packet already buffered; never block PCSX2.
@@ -460,7 +459,6 @@ namespace usb_uepcb
 							selected_seq = first->first;
 							selected_arrival = first->second.arrival;
 							selected_is_forced_skip = true;
-							selected_is_recovered = false;
 						}
 					}
 				}
@@ -478,11 +476,14 @@ namespace usb_uepcb
 			if (packet_it == jb.packets.end())
 				break;
 
+			// Diagnostic only: if a packet first arrived ahead but is now promoted
+			// exactly at the expected playback point, that reorder was recovered.
+			if (!selected_is_forced_skip && packet_it->second.diag_was_ahead)
+				++jb.diag_recovered;
+
 			s->pending_rx.push_back(std::move(packet_it->second.data));
 			jb.packets.erase(packet_it);
 			jb.next_seq = selected_seq + 1;
-			if (selected_is_recovered)
-				++jb.diag_recovered;
 			jb.gap_active = false;
 
 			if (!jb.last_target_change_valid)
@@ -514,7 +515,7 @@ namespace usb_uepcb
 
 				// Real, unresolved gap - this is the only place target_packets
 				// grows now. One step at a time, same as 1.2.
-				if (jb.target_packets < kJitterMaxTarget)
+				if (jb.target_packets < s->jitter_max_target)
 				{
 					++jb.target_packets;
 					Console.WriteLn(
@@ -526,13 +527,13 @@ namespace usb_uepcb
 			else
 			{
 				// Time-based decay: relax by one step once it's genuinely
-				// been calm for kJitterDecayInterval, rather than requiring
+				// been calm for s->jitter_decay_interval, rather than requiring
 				// N consecutive perfect deliveries that any single hiccup
 				// would reset to zero.
 				const auto since_change =
 					std::chrono::duration_cast<std::chrono::milliseconds>(now - jb.last_target_change);
 
-				if (jb.target_packets > kJitterMinTarget && since_change >= kJitterDecayInterval)
+				if (jb.target_packets > s->jitter_min_target && since_change >= s->jitter_decay_interval)
 				{
 					--jb.target_packets;
 					jb.last_target_change = now;
@@ -901,7 +902,7 @@ namespace usb_uepcb
 		if (s->recv_thread.joinable())
 			s->recv_thread.join();
 
-		// 1.3.1 end-of-session diagnostics. Printed only during device teardown
+		// 1.3.2 end-of-session diagnostics. Printed only during device teardown
 		// so normal packet processing gets no periodic logging overhead.
 		{
 			std::lock_guard<std::mutex> lock(s->jitter_lock);
@@ -932,9 +933,24 @@ namespace usb_uepcb
 			s->broadcast_ip = USB::GetConfigString(si, port, TypeName(), "TargetIP", "255.255.255.255");
 			s->udp_port = USB::GetConfigInt(si, port, TypeName(), "Port", 7500);
 
-			// 1.3.1 shared Peer IP history. The supplied branch only demonstrates
-			// SettingInfo String/Integer fields, so this uses numeric selectors
-			// rather than relying on an unverified ComboBox/Button enum type.
+			// 1.3.2 manual adaptive jitter tuning. Clamp values defensively so a
+			// typo cannot create an unbounded queue or excessive wait.
+			const int grace_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterGraceMs", 3), 0, 20);
+			const int decay_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterDecayMs", 4000), 250, 60000);
+			const int min_target = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMinTarget", 1), 1, 8);
+			const int max_target = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxTarget", 4), min_target, 8);
+			const int max_packets = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxPackets", 8), max_target, 32);
+			s->jitter_grace = std::chrono::milliseconds(grace_ms);
+			s->jitter_decay_interval = std::chrono::milliseconds(decay_ms);
+			s->jitter_min_target = static_cast<u32>(min_target);
+			s->jitter_max_target = static_cast<u32>(max_target);
+			s->jitter_max_packets = static_cast<size_t>(max_packets);
+			Console.WriteLn("UePcb: Jitter tuning Grace=%dms Decay=%dms Min=%d Max=%d Queue=%d",
+				grace_ms, decay_ms, min_target, max_target, max_packets);
+
+			// 1.3.2 shared Peer IP history. Boolean is now confirmed for native
+			// Remember/Clear checkboxes; peer history selection remains numeric
+			// until a dynamic editable list UI is intentionally added later.
 			static constexpr int kHistorySlots = 10;
 			std::array<std::string, kHistorySlots> history{};
 			for (int i = 0; i < kHistorySlots; ++i)
@@ -949,7 +965,7 @@ namespace usb_uepcb
 			};
 
 			const bool clear_history =
-				(USB::GetConfigInt(si, port, TypeName(), "ClearIPHistory", 0) != 0);
+				USB::GetConfigBool(si, port, TypeName(), "ClearIPHistory", false);
 			if (clear_history)
 			{
 				for (int i = 0; i < kHistorySlots; ++i)
@@ -963,7 +979,7 @@ namespace usb_uepcb
 					const std::string key = "Peer" + std::to_string(i + 1) + "HistorySlot";
 					si.SetUIntValue(config_section.c_str(), real_key(key).c_str(), 0);
 				}
-				si.SetUIntValue(config_section.c_str(), real_key("ClearIPHistory").c_str(), 0);
+				si.SetBoolValue(config_section.c_str(), real_key("ClearIPHistory").c_str(), false);
 				Console.WriteLn("UePcb: shared Peer IP history cleared");
 			}
 
@@ -981,7 +997,7 @@ namespace usb_uepcb
 			}
 
 			const bool remember_history =
-				(USB::GetConfigInt(si, port, TypeName(), "RememberCurrentIPs", 0) != 0);
+				USB::GetConfigBool(si, port, TypeName(), "RememberCurrentIPs", false);
 			if (remember_history && !clear_history)
 			{
 				std::array<std::string, kHistorySlots> updated{};
@@ -1010,7 +1026,7 @@ namespace usb_uepcb
 					const std::string key = "History" + std::to_string(i + 1);
 					si.SetStringValue(config_section.c_str(), real_key(key).c_str(), history[i].c_str());
 				}
-				si.SetUIntValue(config_section.c_str(), real_key("RememberCurrentIPs").c_str(), 0);
+				si.SetBoolValue(config_section.c_str(), real_key("RememberCurrentIPs").c_str(), false);
 				Console.WriteLn("UePcb: remembered current Peer IPs into shared history");
 			}
 
@@ -1096,7 +1112,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - 1.3.1 Experimental Adaptive)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - 1.3.2 Experimental Adaptive)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1159,16 +1175,16 @@ namespace usb_uepcb
 				.description = "Select the same shared history pool as Peer 1 and Peer 2.",
 				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
 
-			{.type = SettingInfo::Type::Integer,
+			{.type = SettingInfo::Type::Boolean,
 				.name = "RememberCurrentIPs",
-				.display_name = "Remember Current Peer IPs (set 1, then Apply)",
-				.description = "Set to 1 and Apply. Current resolved Peer1-3 IPs are moved to the front of the shared 10-entry history, duplicates removed; it resets to 0 automatically.",
-				.default_value = "0", .min_value = "0", .max_value = "1", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer,
+				.display_name = "Remember Current Peer IPs",
+				.description = "Check and Apply. Current resolved Peer1-3 IPs are moved to the front of the shared 10-entry history, duplicates removed; it unchecks automatically.",
+				.default_value = "false"},
+			{.type = SettingInfo::Type::Boolean,
 				.name = "ClearIPHistory",
-				.display_name = "Clear Shared IP History (set 1, then Apply)",
-				.description = "Set to 1 and Apply to clear all 10 saved IPs and reset Peer history selectors to Manual. It resets to 0 automatically.",
-				.default_value = "0", .min_value = "0", .max_value = "1", .step_value = "1"},
+				.display_name = "Clear Shared IP History",
+				.description = "Check and Apply to clear all 10 saved IPs and reset Peer history selectors to Manual. It unchecks automatically.",
+				.default_value = "false"},
 
 			{.type = SettingInfo::Type::String, .name = "History1", .display_name = "Saved IP 1 (Newest)", .description = "Shared Peer IP history entry.", .default_value = ""},
 			{.type = SettingInfo::Type::String, .name = "History2", .display_name = "Saved IP 2", .description = "Shared Peer IP history entry.", .default_value = ""},
@@ -1180,6 +1196,33 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::String, .name = "History8", .display_name = "Saved IP 8", .description = "Shared Peer IP history entry.", .default_value = ""},
 			{.type = SettingInfo::Type::String, .name = "History9", .display_name = "Saved IP 9", .description = "Shared Peer IP history entry.", .default_value = ""},
 			{.type = SettingInfo::Type::String, .name = "History10", .display_name = "Saved IP 10 (Oldest)", .description = "Shared Peer IP history entry.", .default_value = ""},
+
+			// Adaptive jitter tuning. Defaults exactly match 1.3/1.3.1.
+			{.type = SettingInfo::Type::Integer,
+				.name = "JitterGraceMs",
+				.display_name = "Jitter Grace (ms)",
+				.description = "Grace window for a missing sequence before forced skip. Default 3 ms. Suggested test range: 2-6 ms.",
+				.default_value = "3", .min_value = "0", .max_value = "20", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer,
+				.name = "JitterDecayMs",
+				.display_name = "Buffer Decay (ms)",
+				.description = "Stable time before target buffer relaxes by one step. Default 4000 ms. Try 8000 or 12000 for smoother behavior.",
+				.default_value = "4000", .min_value = "250", .max_value = "60000", .step_value = "250"},
+			{.type = SettingInfo::Type::Integer,
+				.name = "JitterMinTarget",
+				.display_name = "Minimum Target Buffer (packets)",
+				.description = "Minimum adaptive target depth. Default 1. Leave at 1 for normal testing.",
+				.default_value = "1", .min_value = "1", .max_value = "8", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer,
+				.name = "JitterMaxTarget",
+				.display_name = "Maximum Target Buffer (packets)",
+				.description = "Maximum adaptive target depth. Default 4. Leave at 4 initially.",
+				.default_value = "4", .min_value = "1", .max_value = "8", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer,
+				.name = "JitterMaxPackets",
+				.display_name = "Maximum Jitter Queue (packets)",
+				.description = "Hard per-peer jitter queue limit. Default 8. Keep small to avoid latency buildup.",
+				.default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
 
 			{.type = SettingInfo::Type::String,
 				.name = "MacHex",
