@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.3.3 (Experimental Adaptive)
+// usb-uepcb1.4 (Experimental Adaptive)
 // Based on: Claude UePcb 1.3
 //
-// 1.3.3 changes:
+// 1.4 changes:
+//   - Polished compact two-column UEPCB settings UI (paired ControllerBindingWidget file).
+//   - History remains dropdown-based; History1..History10 stay hidden backend storage.
+//   - Description text now follows the active Qt theme for high contrast.
+//   - Expanded help text without changing synchronization/network behavior.
 //   - Keeps the 1.3.1 shared 10-slot Peer IP history pool.
 //   - Remember/Clear are native Boolean checkbox settings.
 //   - Grace/Decay/MinTarget/MaxTarget/MaxQueue are user-adjustable settings.
@@ -1113,7 +1117,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - 1.3.3 Experimental Adaptive)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - 1.4 Experimental Adaptive)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
