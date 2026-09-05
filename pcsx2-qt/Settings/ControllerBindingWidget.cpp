@@ -667,11 +667,71 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			{
 				QLineEdit* le = new QLineEdit(widget_parent);
 				le->setObjectName(QString::fromUtf8(si.name));
+				// Claude UePcb 1.4: key_name is reused below for UePcb's Peer
+				// IP history combo, so it's passed by copy here instead of
+				// std::move - negligible cost (this runs once per settings
+				// dialog open), and every other case in this switch is left
+				// exactly as before.
 				ControllerSettingWidgetBinder::BindWidgetToInputProfileString(
-					sif, le, m_config_section, std::move(key_name), si.StringDefaultValue());
-				layout->addWidget(new QLabel(qApp->translate(translation_ctx, si.display_name), widget_parent), current_row, 0);
-				layout->addWidget(le, current_row, 1, 1, 3);
-				current_row++;
+					sif, le, m_config_section, key_name, si.StringDefaultValue());
+
+				// UePcb's Peer1-3 IP fields get a small companion "history"
+				// combo box next to the text field. Picking an entry copies
+				// it straight into the QLineEdit and writes it to the same
+				// ini key the field itself already uses - this does not
+				// depend on how SettingAccessor<QComboBox> reads an editable
+				// combo box's value (untested/unconfirmed in this codebase),
+				// since the combo here is never itself bound to a setting.
+				const bool is_uepcb_peer_ip = (m_config_prefix == "UePcb_") &&
+					(si.name == std::string("Peer1IP") ||
+						si.name == std::string("Peer2IP") ||
+						si.name == std::string("Peer3IP"));
+
+				if (is_uepcb_peer_ip)
+				{
+					QComboBox* history_combo = new QComboBox(widget_parent);
+					history_combo->setPlaceholderText(tr("Recent..."));
+					history_combo->setMinimumContentsLength(12);
+
+					for (int i = 1; i <= 10; i++)
+					{
+						const std::string hist_key = m_config_prefix + "History" + std::to_string(i);
+						const QString ip = QString::fromStdString(
+							sif->GetStringValue(m_config_section.c_str(), hist_key.c_str(), ""));
+						if (!ip.isEmpty())
+							history_combo->addItem(ip, ip);
+					}
+
+					connect(history_combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+						[sif, le, history_combo, section = m_config_section, key_name](int index) {
+							if (index < 0)
+								return;
+							const QString ip = history_combo->currentData().toString();
+							if (ip.isEmpty())
+								return;
+							le->setText(ip);
+							sif->SetStringValue(section.c_str(), key_name.c_str(), ip.toUtf8().constData());
+						});
+
+					// Fires currentIndexChanged(-1) once, harmlessly ignored
+					// above (index < 0) - just here so the placeholder text
+					// shows instead of the first history entry looking
+					// pre-selected/applied.
+					history_combo->setCurrentIndex(-1);
+
+					QHBoxLayout* hbox = new QHBoxLayout();
+					hbox->addWidget(le, 1);
+					hbox->addWidget(history_combo);
+					layout->addWidget(new QLabel(qApp->translate(translation_ctx, si.display_name), widget_parent), current_row, 0);
+					layout->addLayout(hbox, current_row, 1, 1, 3);
+					current_row++;
+				}
+				else
+				{
+					layout->addWidget(new QLabel(qApp->translate(translation_ctx, si.display_name), widget_parent), current_row, 0);
+					layout->addWidget(le, current_row, 1, 1, 3);
+					current_row++;
+				}
 			}
 			break;
 
