@@ -1,28 +1,16 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// Claude UePcb 1.4
-// Based on: usb-uepcb1.3.2 (Experimental Adaptive), which was based on
-// Claude UePcb 1.3, which was based on usb-uepcb_fixed_udp_1_2_dynamic_buildfix.cpp
+// usb-uepcb1.3.3 (Experimental Adaptive)
+// Based on: Claude UePcb 1.3
 //
-// 1.4 changes (Peer IP history UI, paired with a small edit to
-// ControllerBindingWidget.cpp - see accompanying notes):
-//   - Removed the Peer1-3HistorySlot number fields and the
-//     "RememberCurrentIPs" checkbox from 1.3.1/1.3.2. History is now saved
-//     automatically on every Apply, using whatever Peer1-3 IPs are
-//     currently set - no separate flag to remember to tick.
-//   - Removed the ten visible "History1..10" text boxes from Settings().
-//     They still exist as backing storage (read/written under the same
-//     ini keys as before), just no longer cluttering the settings page.
-//   - Peer1IP/Peer2IP/Peer3IP are back to plain manual string fields, same
-//     as 1.3. The actual picker UI is a small combo box added next to each
-//     field directly in ControllerBindingWidget.cpp, which writes chosen
-//     values straight back into these same fields - usb-uepcb.cpp itself
-//     doesn't need to know the picker exists.
-//   - Kept from 1.3.2, unchanged: JitterGraceMs/JitterDecayMs/
-//     JitterMinTarget/JitterMaxTarget/JitterMaxPackets user-adjustable
-//     settings, and the diagnostic counters (diag_rx/diag_ahead/
-//     diag_recovered/diag_forced_skip/diag_late/diag_duplicate).
+// 1.3.3 changes:
+//   - Keeps the 1.3.1 shared 10-slot Peer IP history pool.
+//   - Remember/Clear are native Boolean checkbox settings.
+//   - Grace/Decay/MinTarget/MaxTarget/MaxQueue are user-adjustable settings.
+//   - Defaults reproduce Claude 1.3/1.3.1 synchronization timing.
+//   - Recovered diagnostic now counts ahead-arriving packets later promoted in order.
+// Based on: usb-uepcb_fixed_udp_1_2_dynamic_buildfix.cpp
 //
 // Change from 1.2: the adaptive jitter buffer's grow/decay logic was
 // asymmetric in a way that real-world Wi-Fi test logs showed pins
@@ -101,7 +89,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.4 (LAN + Direct UDP + Adaptive Jitter Buffer)", ""};
+		"", "Namco", "UE PCB v1.3 (LAN + Direct UDP + Adaptive Jitter Buffer)", ""};
 
 	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
 	// frame. This is purely an emulator-side addition (real UE PCB hardware
@@ -164,7 +152,7 @@ namespace usb_uepcb
 			bool seq_valid = false;
 			u32 target_packets = 1;
 
-			// 1.3.2 diagnostics only. These counters never affect playback timing.
+			// 1.3.3 diagnostics only. These counters never affect playback timing.
 			u64 diag_rx = 0;
 			u64 diag_ahead = 0;
 			u64 diag_recovered = 0;
@@ -186,14 +174,14 @@ namespace usb_uepcb
 		std::mutex jitter_lock;
 		u32 loss_log_suppress = 0;
 
-		// 1.3.2 diagnostic: forced skips on different peers in a very short
+		// 1.3.3 diagnostic: forced skips on different peers in a very short
 		// window are more suggestive of a local emulator/USB scheduling stall
 		// than independent network loss. This is logging only.
 		std::chrono::steady_clock::time_point diag_last_forced_time{};
 		u64 diag_last_forced_peer = 0;
 		bool diag_last_forced_valid = false;
 
-		// 1.3.2 user-tunable adaptive jitter parameters. Defaults reproduce
+		// 1.3.3 user-tunable adaptive jitter parameters. Defaults reproduce
 		// Claude 1.3/1.3.1 behavior exactly. Values are clamped on load.
 		size_t jitter_max_packets = 8;
 		u32 jitter_min_target = 1;
@@ -322,7 +310,7 @@ namespace usb_uepcb
 		return k;
 	}
 
-	// Adaptive jitter parameters are stored per UePcbState in 1.3.2 so they
+	// Adaptive jitter parameters are stored per UePcbState in 1.3.3 so they
 	// can be tuned from the USB settings UI without recompiling. Defaults
 	// remain Grace=3ms, Decay=4000ms, MinTarget=1, MaxTarget=4, Queue=8.
 
@@ -365,7 +353,8 @@ namespace usb_uepcb
 		{
 			++jb.diag_ahead;
 			const u32 ahead = seq - jb.next_seq;
-			jb.diag_max_ahead = std::max(jb.diag_max_ahead, ahead);
+			if (ahead > jb.diag_max_ahead)
+				jb.diag_max_ahead = ahead;
 		}
 
 		// Claude UePcb 1.3: target_packets is deliberately NOT touched here
@@ -914,7 +903,7 @@ namespace usb_uepcb
 		if (s->recv_thread.joinable())
 			s->recv_thread.join();
 
-		// 1.3.2 end-of-session diagnostics. Printed only during device teardown
+		// 1.3.3 end-of-session diagnostics. Printed only during device teardown
 		// so normal packet processing gets no periodic logging overhead.
 		{
 			std::lock_guard<std::mutex> lock(s->jitter_lock);
@@ -945,7 +934,7 @@ namespace usb_uepcb
 			s->broadcast_ip = USB::GetConfigString(si, port, TypeName(), "TargetIP", "255.255.255.255");
 			s->udp_port = USB::GetConfigInt(si, port, TypeName(), "Port", 7500);
 
-			// 1.3.2 manual adaptive jitter tuning. Clamp values defensively so a
+			// 1.3.3 manual adaptive jitter tuning. Clamp values defensively so a
 			// typo cannot create an unbounded queue or excessive wait.
 			const int grace_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterGraceMs", 3), 0, 20);
 			const int decay_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterDecayMs", 4000), 250, 60000);
@@ -960,17 +949,9 @@ namespace usb_uepcb
 			Console.WriteLn("UePcb: Jitter tuning Grace=%dms Decay=%dms Min=%d Max=%d Queue=%d",
 				grace_ms, decay_ms, min_target, max_target, max_packets);
 
-			// Claude UePcb 1.4: Peer1-3 IP are read directly, same as 1.3 - no
-			// slot indirection. The "HistorySlot" number fields and the
-			// "RememberCurrentIPs" checkbox from 1.3.1/1.3.2 are gone; instead,
-			// a small companion "history" combo box lives right next to each
-			// Peer IP field in the Qt settings widget (ControllerBindingWidget.cpp)
-			// and writes directly into the same Peer1-3IP ini keys read below -
-			// from usb-uepcb.cpp's point of view there's still just one plain
-			// string per peer, exactly like 1.3. History1-10 remain as backing
-			// storage only (read here and by that combo box); they're
-			// deliberately no longer listed in Settings() so they don't show
-			// up as ten extra text boxes in the UI.
+			// 1.3.3 shared Peer IP history. Boolean is now confirmed for native
+			// Remember/Clear checkboxes; peer history selection remains numeric
+			// until a dynamic editable list UI is intentionally added later.
 			static constexpr int kHistorySlots = 10;
 			std::array<std::string, kHistorySlots> history{};
 			for (int i = 0; i < kHistorySlots; ++i)
@@ -994,23 +975,31 @@ namespace usb_uepcb
 					const std::string key = "History" + std::to_string(i + 1);
 					si.SetStringValue(config_section.c_str(), real_key(key).c_str(), "");
 				}
+				for (int i = 0; i < 3; ++i)
+				{
+					const std::string key = "Peer" + std::to_string(i + 1) + "HistorySlot";
+					si.SetUIntValue(config_section.c_str(), real_key(key).c_str(), 0);
+				}
 				si.SetBoolValue(config_section.c_str(), real_key("ClearIPHistory").c_str(), false);
 				Console.WriteLn("UePcb: shared Peer IP history cleared");
 			}
 
+			std::array<std::string, 3> manual_peer_ips{};
 			for (int i = 0; i < 3; ++i)
 			{
 				const std::string ip_key = "Peer" + std::to_string(i + 1) + "IP";
-				s->peer_ips[i] = USB::GetConfigString(si, port, TypeName(), ip_key.c_str(), "");
+				manual_peer_ips[i] = USB::GetConfigString(si, port, TypeName(), ip_key.c_str(), "");
+				s->peer_ips[i] = manual_peer_ips[i];
+
+				const std::string slot_key = "Peer" + std::to_string(i + 1) + "HistorySlot";
+				const int slot = USB::GetConfigInt(si, port, TypeName(), slot_key.c_str(), 0);
+				if (slot >= 1 && slot <= kHistorySlots && !history[slot - 1].empty())
+					s->peer_ips[i] = history[slot - 1];
 			}
 
-			// Auto-remember: every time the device is (re)created - i.e. every
-			// time Apply/OK is pressed with this device selected - whichever
-			// Peer IPs are currently non-empty are pushed to the front of the
-			// shared history (MRU order, de-duplicated). No separate checkbox
-			// to remember to tick; skip this when we just cleared, so a clear
-			// isn't immediately undone by the IPs still sitting in the fields.
-			if (!clear_history)
+			const bool remember_history =
+				USB::GetConfigBool(si, port, TypeName(), "RememberCurrentIPs", false);
+			if (remember_history && !clear_history)
 			{
 				std::array<std::string, kHistorySlots> updated{};
 				int used = 0;
@@ -1026,20 +1015,20 @@ namespace usb_uepcb
 					updated[used++] = ip;
 				};
 
+				// Current resolved Peer IPs become the MRU entries.
 				for (const std::string& ip : s->peer_ips)
 					add_unique(ip);
 				for (const std::string& ip : history)
 					add_unique(ip);
 
-				if (used > 0 && updated != history)
+				history = updated;
+				for (int i = 0; i < kHistorySlots; ++i)
 				{
-					history = updated;
-					for (int i = 0; i < kHistorySlots; ++i)
-					{
-						const std::string key = "History" + std::to_string(i + 1);
-						si.SetStringValue(config_section.c_str(), real_key(key).c_str(), history[i].c_str());
-					}
+					const std::string key = "History" + std::to_string(i + 1);
+					si.SetStringValue(config_section.c_str(), real_key(key).c_str(), history[i].c_str());
 				}
+				si.SetBoolValue(config_section.c_str(), real_key("RememberCurrentIPs").c_str(), false);
+				Console.WriteLn("UePcb: remembered current Peer IPs into shared history");
 			}
 
 			for (int i = 0; i < 3; ++i)
@@ -1124,7 +1113,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - Claude UePcb 1.4)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - 1.3.3 Experimental Adaptive)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1154,35 +1143,60 @@ namespace usb_uepcb
 				.max_value = "65535",
 				.step_value = "1"},
 
-			// Claude UePcb 1.4: Peer1-3 IP are plain manual fields again (no
-			// history-slot number). In the Qt settings dialog
-			// (ControllerBindingWidget.cpp), each of these three gets a small
-			// companion "history" combo box next to it - picking an entry
-			// there writes straight into this same field. The shared history
-			// itself is still auto-saved on every Apply (see CreateDevice())
-			// into ten internal "History1..10" ini keys that are deliberately
-			// NOT listed here, so they don't show up as ten extra text boxes.
 			{.type = SettingInfo::Type::String,
 				.name = "Peer1IP",
-				.display_name = "Direct Peer 1 IP",
-				.description = "IPv4 address of one of the other machines. A \"Recent...\" dropdown with previously used IPs appears next to this field.",
+				.display_name = "Direct Peer 1 IP (Manual)",
+				.description = "Manual IPv4 address. Used when Peer 1 History Slot is 0.",
 				.default_value = ""},
+			{.type = SettingInfo::Type::Integer,
+				.name = "Peer1HistorySlot",
+				.display_name = "Peer 1 History Slot (0=Manual, 1-10=Saved)",
+				.description = "Select a shared saved IP. 0 uses Direct Peer 1 IP above.",
+				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+
 			{.type = SettingInfo::Type::String,
 				.name = "Peer2IP",
-				.display_name = "Direct Peer 2 IP",
-				.description = "IPv4 address of one of the other machines.",
+				.display_name = "Direct Peer 2 IP (Manual)",
+				.description = "Manual IPv4 address. Used when Peer 2 History Slot is 0.",
 				.default_value = ""},
+			{.type = SettingInfo::Type::Integer,
+				.name = "Peer2HistorySlot",
+				.display_name = "Peer 2 History Slot (0=Manual, 1-10=Saved)",
+				.description = "Select the same shared history pool as Peer 1.",
+				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+
 			{.type = SettingInfo::Type::String,
 				.name = "Peer3IP",
-				.display_name = "Direct Peer 3 IP",
-				.description = "IPv4 address of one of the other machines.",
+				.display_name = "Direct Peer 3 IP (Manual)",
+				.description = "Manual IPv4 address. Used when Peer 3 History Slot is 0.",
 				.default_value = ""},
+			{.type = SettingInfo::Type::Integer,
+				.name = "Peer3HistorySlot",
+				.display_name = "Peer 3 History Slot (0=Manual, 1-10=Saved)",
+				.description = "Select the same shared history pool as Peer 1 and Peer 2.",
+				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
 
+			{.type = SettingInfo::Type::Boolean,
+				.name = "RememberCurrentIPs",
+				.display_name = "Remember Current Peer IPs",
+				.description = "Check and Apply. Current resolved Peer1-3 IPs are moved to the front of the shared 10-entry history, duplicates removed; it unchecks automatically.",
+				.default_value = "false"},
 			{.type = SettingInfo::Type::Boolean,
 				.name = "ClearIPHistory",
 				.display_name = "Clear Shared IP History",
-				.description = "Check and Apply to clear all saved IPs shown in the \"Recent...\" dropdowns. It unchecks automatically.",
+				.description = "Check and Apply to clear all 10 saved IPs and reset Peer history selectors to Manual. It unchecks automatically.",
 				.default_value = "false"},
+
+			{.type = SettingInfo::Type::String, .name = "History1", .display_name = "Saved IP 1 (Newest)", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History2", .display_name = "Saved IP 2", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History3", .display_name = "Saved IP 3", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History4", .display_name = "Saved IP 4", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History5", .display_name = "Saved IP 5", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History6", .display_name = "Saved IP 6", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History7", .display_name = "Saved IP 7", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History8", .display_name = "Saved IP 8", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History9", .display_name = "Saved IP 9", .description = "Shared Peer IP history entry.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History10", .display_name = "Saved IP 10 (Oldest)", .description = "Shared Peer IP history entry.", .default_value = ""},
 
 			// Adaptive jitter tuning. Defaults exactly match 1.3/1.3.1.
 			{.type = SettingInfo::Type::Integer,

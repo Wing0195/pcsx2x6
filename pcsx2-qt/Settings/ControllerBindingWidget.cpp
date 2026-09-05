@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include <QtCore/QDir>
+#include <QtGui/QFont>
 #include <QtWidgets/QInputDialog>
 #include <QtWidgets/QMenu>
 #include <QtWidgets/QMessageBox>
@@ -586,6 +587,116 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
+	// UE PCB has a compact custom layout. History1..History10 remain persisted
+	// settings, but are intentionally hidden here and exposed through the three
+	// history dropdowns instead. This does not affect other USB device UIs.
+	if (m_config_prefix == "UePcb_")
+	{
+		layout->setColumnStretch(1, 1);
+		layout->setColumnStretch(3, 1);
+		layout->setHorizontalSpacing(12);
+		layout->setVerticalSpacing(5);
+
+		const auto makeSmallDescription = [&](const QString& text, int row) {
+			QLabel* desc = new QLabel(text, widget_parent);
+			desc->setWordWrap(true);
+			QFont f = desc->font();
+			if (f.pointSizeF() > 0.0)
+				f.setPointSizeF(f.pointSizeF() * 0.90);
+			desc->setFont(f);
+			desc->setStyleSheet(QStringLiteral("color: palette(mid);"));
+			layout->addWidget(desc, row, 0, 1, 4);
+		};
+
+		const auto addString = [&](const char* key, const QString& label, const char* def, int row, int col) {
+			QLabel* l = new QLabel(label, widget_parent);
+			QLineEdit* le = new QLineEdit(widget_parent);
+			le->setObjectName(QString::fromUtf8(key));
+			ControllerSettingWidgetBinder::BindWidgetToInputProfileString(
+				sif, le, m_config_section, m_config_prefix + key, def);
+			layout->addWidget(l, row, col);
+			layout->addWidget(le, row, col + 1);
+			return le;
+		};
+
+		const auto addInt = [&](const char* key, const QString& label, int def, int minv, int maxv, int step, int row, int col) {
+			QLabel* l = new QLabel(label, widget_parent);
+			QSpinBox* sb = new QSpinBox(widget_parent);
+			sb->setObjectName(QString::fromUtf8(key));
+			sb->setRange(minv, maxv);
+			sb->setSingleStep(step);
+			ControllerSettingWidgetBinder::BindWidgetToInputProfileInt(
+				sif, sb, m_config_section, m_config_prefix + key, def);
+			layout->addWidget(l, row, col);
+			layout->addWidget(sb, row, col + 1);
+			return sb;
+		};
+
+		const auto addHistoryCombo = [&](int peer, int row) {
+			const std::string slot_key = fmt::format("Peer{}HistorySlot", peer);
+			QComboBox* cb = new QComboBox(widget_parent);
+			cb->setObjectName(QString::fromStdString(slot_key));
+			cb->addItem(tr("Manual"));
+			for (int i = 1; i <= 10; i++)
+			{
+				const std::string history_key = m_config_prefix + fmt::format("History{}", i);
+				const std::string ip = m_dialog->getStringValue(m_config_section.c_str(), history_key.c_str(), "");
+				cb->addItem(ip.empty() ? tr("Saved IP %1 - (empty)").arg(i) : tr("Saved IP %1 - %2").arg(i).arg(QString::fromStdString(ip)));
+			}
+			ControllerSettingWidgetBinder::BindWidgetToInputProfileInt(
+				sif, cb, m_config_section, m_config_prefix + slot_key, 0, 0);
+			layout->addWidget(new QLabel(tr("Saved IP"), widget_parent), row, 2);
+			layout->addWidget(cb, row, 3);
+		};
+
+		addString("TargetIP", tr("Target Broadcast"), "255.255.255.255", current_row, 0);
+		addInt("Port", tr("UDP Port"), 7500, 1, 65535, 1, current_row, 2);
+		current_row++;
+		makeSmallDescription(tr("Broadcast is used only when all Direct Peer IPs are empty. Default UDP port: 7500."), current_row++);
+
+		for (int peer = 1; peer <= 3; peer++)
+		{
+			addString(fmt::format("Peer{}IP", peer).c_str(), tr("Direct Peer %1 IP").arg(peer), "", current_row, 0);
+			addHistoryCombo(peer, current_row);
+			current_row++;
+		}
+		makeSmallDescription(tr("Choose Manual to use the IP field, or choose one of the shared saved-IP slots."), current_row++);
+
+		QCheckBox* remember = new QCheckBox(tr("Remember Current Peer IPs"), widget_parent);
+		remember->setObjectName(QStringLiteral("RememberCurrentIPs"));
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, remember, m_config_section, m_config_prefix + "RememberCurrentIPs", false);
+		layout->addWidget(remember, current_row, 0, 1, 2);
+		QCheckBox* clear = new QCheckBox(tr("Clear Shared IP History"), widget_parent);
+		clear->setObjectName(QStringLiteral("ClearIPHistory"));
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, clear, m_config_section, m_config_prefix + "ClearIPHistory", false);
+		layout->addWidget(clear, current_row, 2, 1, 2);
+		current_row++;
+		makeSmallDescription(tr("Remember moves the current Peer 1-3 IPs to the front of the shared 10-entry history. Clear removes all saved IPs."), current_row++);
+
+		addInt("JitterGraceMs", tr("Jitter Grace (ms)"), 3, 0, 20, 1, current_row, 0);
+		addInt("JitterDecayMs", tr("Buffer Decay (ms)"), 4000, 250, 60000, 250, current_row, 2);
+		current_row++;
+		addInt("JitterMinTarget", tr("Minimum Target Buffer"), 1, 1, 8, 1, current_row, 0);
+		addInt("JitterMaxTarget", tr("Maximum Target Buffer"), 4, 1, 8, 1, current_row, 2);
+		current_row++;
+		addInt("JitterMaxPackets", tr("Maximum Jitter Queue"), 8, 1, 32, 1, current_row, 0);
+		addString("MacHex", tr("MAC 12-hex"), "", current_row, 2);
+		current_row++;
+		makeSmallDescription(tr("Defaults: Grace 3 ms, Decay 4000 ms, Min 1, Max 4, Queue 8. Leave MAC blank for automatic generation."), current_row++);
+
+		QHBoxLayout* bottom_hlayout = new QHBoxLayout();
+		QPushButton* restore_defaults = new QPushButton(tr("Restore Default Settings"), this);
+		restore_defaults->setIcon(QIcon::fromTheme(QStringLiteral("restart-line")));
+		connect(restore_defaults, &QPushButton::clicked, this, &ControllerCustomSettingsWidget::restoreDefaults);
+		bottom_hlayout->addStretch(1);
+		bottom_hlayout->addWidget(restore_defaults);
+		layout->addLayout(bottom_hlayout, current_row++, 0, 1, 4);
+		layout->addItem(new QSpacerItem(1, 1, QSizePolicy::Minimum, QSizePolicy::Expanding), current_row++, 0, 1, 4);
+		return;
+	}
+
 	for (const SettingInfo& si : m_settings)
 	{
 		std::string key_name = m_config_prefix + si.name;
@@ -667,71 +778,11 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			{
 				QLineEdit* le = new QLineEdit(widget_parent);
 				le->setObjectName(QString::fromUtf8(si.name));
-				// Claude UePcb 1.4: key_name is reused below for UePcb's Peer
-				// IP history combo, so it's passed by copy here instead of
-				// std::move - negligible cost (this runs once per settings
-				// dialog open), and every other case in this switch is left
-				// exactly as before.
 				ControllerSettingWidgetBinder::BindWidgetToInputProfileString(
-					sif, le, m_config_section, key_name, si.StringDefaultValue());
-
-				// UePcb's Peer1-3 IP fields get a small companion "history"
-				// combo box next to the text field. Picking an entry copies
-				// it straight into the QLineEdit and writes it to the same
-				// ini key the field itself already uses - this does not
-				// depend on how SettingAccessor<QComboBox> reads an editable
-				// combo box's value (untested/unconfirmed in this codebase),
-				// since the combo here is never itself bound to a setting.
-				const bool is_uepcb_peer_ip = (m_config_prefix == "UePcb_") &&
-					(si.name == std::string("Peer1IP") ||
-						si.name == std::string("Peer2IP") ||
-						si.name == std::string("Peer3IP"));
-
-				if (is_uepcb_peer_ip)
-				{
-					QComboBox* history_combo = new QComboBox(widget_parent);
-					history_combo->setPlaceholderText(tr("Recent..."));
-					history_combo->setMinimumContentsLength(12);
-
-					for (int i = 1; i <= 10; i++)
-					{
-						const std::string hist_key = m_config_prefix + "History" + std::to_string(i);
-						const QString ip = QString::fromStdString(
-							sif->GetStringValue(m_config_section.c_str(), hist_key.c_str(), ""));
-						if (!ip.isEmpty())
-							history_combo->addItem(ip, ip);
-					}
-
-					connect(history_combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-						[sif, le, history_combo, section = m_config_section, key_name](int index) {
-							if (index < 0)
-								return;
-							const QString ip = history_combo->currentData().toString();
-							if (ip.isEmpty())
-								return;
-							le->setText(ip);
-							sif->SetStringValue(section.c_str(), key_name.c_str(), ip.toUtf8().constData());
-						});
-
-					// Fires currentIndexChanged(-1) once, harmlessly ignored
-					// above (index < 0) - just here so the placeholder text
-					// shows instead of the first history entry looking
-					// pre-selected/applied.
-					history_combo->setCurrentIndex(-1);
-
-					QHBoxLayout* hbox = new QHBoxLayout();
-					hbox->addWidget(le, 1);
-					hbox->addWidget(history_combo);
-					layout->addWidget(new QLabel(qApp->translate(translation_ctx, si.display_name), widget_parent), current_row, 0);
-					layout->addLayout(hbox, current_row, 1, 1, 3);
-					current_row++;
-				}
-				else
-				{
-					layout->addWidget(new QLabel(qApp->translate(translation_ctx, si.display_name), widget_parent), current_row, 0);
-					layout->addWidget(le, current_row, 1, 1, 3);
-					current_row++;
-				}
+					sif, le, m_config_section, std::move(key_name), si.StringDefaultValue());
+				layout->addWidget(new QLabel(qApp->translate(translation_ctx, si.display_name), widget_parent), current_row, 0);
+				layout->addWidget(le, current_row, 1, 1, 3);
+				current_row++;
 			}
 			break;
 
@@ -821,6 +872,8 @@ void ControllerCustomSettingsWidget::restoreDefaults()
 				QSpinBox* widget = findChild<QSpinBox*>(QString::fromStdString(si.name));
 				if (widget)
 					widget->setValue(si.IntegerDefaultValue());
+				else if (QComboBox* combo = findChild<QComboBox*>(QString::fromStdString(si.name)))
+					combo->setCurrentIndex(si.IntegerDefaultValue());
 			}
 			break;
 
