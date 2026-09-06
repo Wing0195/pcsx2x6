@@ -1,15 +1,48 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// Claude UePcb 1.4.1
-// History: 1.2 -> Claude 1.3 (fixed jitter buffer grow/decay asymmetry that
-// pinned target_packets at max almost all match) -> 1.3.2 (user-adjustable
-// jitter settings + diagnostics) -> Claude 1.4 (Peer IP history UI; crashed
-// on a null SettingsInterface*) -> 1.3.3 fixed the crash by reading/writing
-// through m_dialog instead of sif directly -> 1.4.1 (this file): same fix,
-// diag_max_ahead uses an explicit if instead of std::max, comments trimmed,
-// and the settings-page description text no longer forces a hard-to-read
-// dark gray color.
+// usb-uepcb1.5 (TCP / UDP Select)
+// Based on: Claude UePcb 1.3
+//
+// 1.5 changes:
+//   - Adds selectable UDP / TCP transport while preserving the 1.4 UDP core.
+//   - TCP uses explicit Host/Client hub topology with 4-byte BE frame length framing.
+//   - TCP RX uses the fixed AN986 BULK IN wrapper (odd Ethernet lengths get 1-byte pad).
+//   - Adds Advanced Settings gate for UDP jitter tuning.
+//   - Keeps shared Saved IP history for UDP peers and TCP Host IP.
+//
+// 1.4 changes:
+//   - Polished compact two-column UEPCB settings UI (paired ControllerBindingWidget file).
+//   - History remains dropdown-based; History1..History10 stay hidden backend storage.
+//   - Description text now follows the active Qt theme for high contrast.
+//   - Expanded help text without changing synchronization/network behavior.
+//   - Keeps the 1.3.1 shared 10-slot Peer IP history pool.
+//   - Remember/Clear are native Boolean checkbox settings.
+//   - Grace/Decay/MinTarget/MaxTarget/MaxQueue are user-adjustable settings.
+//   - Defaults reproduce Claude 1.3/1.3.1 synchronization timing.
+//   - Recovered diagnostic now counts ahead-arriving packets later promoted in order.
+// Based on: usb-uepcb_fixed_udp_1_2_dynamic_buildfix.cpp
+//
+// Change from 1.2: the adaptive jitter buffer's grow/decay logic was
+// asymmetric in a way that real-world Wi-Fi test logs showed pins
+// target_packets at its maximum within the first ~10-40 seconds of a
+// match and keeps it there for 93-98% of the session, even on a run
+// where one side was on wired Ethernet. Root cause: jitter_insert() bumped
+// target_packets the instant ANY packet arrived out of the expected order
+// - including harmless, self-resolving 1-packet swaps, which measured
+// logs showed recurring every ~4-5 seconds on average - while recovery
+// required 120 consecutive perfectly-ordered deliveries (~6-7s at the
+// observed packet rate), a bar that was reset to zero by the very same
+// harmless events and so was essentially never reached.
+//
+// Fix in 1.3:
+//   1) target_packets now only grows in jitter_promote(), at the moment a
+//      missing packet's grace period genuinely expires (i.e. growing the
+//      buffer would actually have helped) - not the instant a reorder is
+//      first observed in jitter_insert().
+//   2) Decay is time-based (configured interval since the last forced
+//      skip) instead of a consecutive-success counter, so one isolated
+//      hiccup no longer wipes out an otherwise-clean multi-minute streak.
 
 #include "USB/qemu-usb/qusb.h"
 #include "USB/qemu-usb/desc.h"
@@ -47,6 +80,7 @@ using socket_t = SOCKET;
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 using socket_t = int;
@@ -67,11 +101,13 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.4.1 (LAN + Direct UDP + Adaptive Jitter Buffer)", ""};
+		"", "Namco", "UE PCB v1.5 (TCP/UDP)", ""};
 
-	// Wire trailer appended after the raw Ethernet frame in every UDP packet.
-	// Emulator-only addition (real hardware never sees this), so the wire
-	// format is safe to change; lets us detect per-peer drops/reordering.
+	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
+	// frame. This is purely an emulator-side addition (real UE PCB hardware
+	// never sees this - it only exists between PCSX2 instances), so it is
+	// safe to change the wire format freely. It lets us detect drops /
+	// reordering per-peer without touching the AN986 driver protocol at all.
 	static constexpr int kWireTrailerSize = sizeof(u32);
 
 	typedef struct UePcbState
@@ -84,8 +120,9 @@ namespace usb_uepcb
 		u8 eeprom_word = 0;
 		std::vector<u8> tx_accum;
 
-		// pending_rx: buffer written by the UDP recv thread. USB IN promotes
-		// a bounded batch per poll so network timing doesn't leak into RX timing.
+		// UDP receive thread writes to pending_rx. The USB IN handler promotes
+		// a small bounded batch at the USB polling boundary. This keeps network
+		// scheduling from directly changing the game-visible RX queue timing.
 		std::deque<std::vector<u8>> pending_rx;
 		std::mutex pending_lock;
 
@@ -104,17 +141,20 @@ namespace usb_uepcb
 		std::mutex in_lock;
 		std::deque<std::vector<u8>> in_q;
 
-		// tx_seq: per-packet outgoing sequence number, lets peers detect gaps.
+		// Outgoing sequence counter, one per this instance. Peers use it to
+		// detect gaps in what they receive *from us*.
 		std::atomic<u32> tx_seq{0};
 
-		// Per-peer bounded adaptive jitter buffers (restores send order, capped
-		// so network trouble can't turn into seconds of added game latency).
+		// Per-peer bounded adaptive jitter buffers. Sequence numbers are used
+		// to restore order within each sender stream. The buffer is deliberately
+		// small so network trouble cannot turn into seconds of game latency.
 		struct JitterPacket
 		{
 			u32 seq = 0;
 			std::vector<u8> data;
 			std::chrono::steady_clock::time_point arrival{};
-			bool diag_was_ahead = false; // diagnostic only
+			// Diagnostic only: packet arrived ahead of the then-current playback point.
+			bool diag_was_ahead = false;
 		};
 
 		struct PeerJitter
@@ -124,7 +164,7 @@ namespace usb_uepcb
 			bool seq_valid = false;
 			u32 target_packets = 1;
 
-			// Diagnostics only, don't affect playback timing.
+			// 1.3.3 diagnostics only. These counters never affect playback timing.
 			u64 diag_rx = 0;
 			u64 diag_ahead = 0;
 			u64 diag_recovered = 0;
@@ -132,9 +172,10 @@ namespace usb_uepcb
 			u64 diag_late = 0;
 			u64 diag_duplicate = 0;
 			u32 diag_max_ahead = 0;
-
-			// Time-based decay (see jitter_decay_interval) instead of a
-			// consecutive-success counter, so one hiccup can't reset progress.
+			// Claude UePcb 1.3: replaces the old "stable_deliveries" counter.
+			// Decay is now time-based (see jitter_decay_interval) so a single
+			// isolated reorder can't zero out several seconds of otherwise
+			// clean delivery and re-arm a long climb back to the max.
 			std::chrono::steady_clock::time_point last_target_change{};
 			bool last_target_change_valid = false;
 			std::chrono::steady_clock::time_point gap_since{};
@@ -145,20 +186,38 @@ namespace usb_uepcb
 		std::mutex jitter_lock;
 		u32 loss_log_suppress = 0;
 
-		// Forced skips on different peers within a short window suggest a
-		// local stall rather than independent network loss. Logging only.
+		// 1.3.3 diagnostic: forced skips on different peers in a very short
+		// window are more suggestive of a local emulator/USB scheduling stall
+		// than independent network loss. This is logging only.
 		std::chrono::steady_clock::time_point diag_last_forced_time{};
 		u64 diag_last_forced_peer = 0;
 		bool diag_last_forced_valid = false;
 
-		// User-tunable jitter parameters (Settings page). Defaults match 1.3.
+		// 1.3.3 user-tunable adaptive jitter parameters. Defaults reproduce
+		// Claude 1.3/1.3.1 behavior exactly. Values are clamped on load.
 		size_t jitter_max_packets = 8;
 		u32 jitter_min_target = 1;
 		u32 jitter_max_target = 4;
 		std::chrono::milliseconds jitter_grace{3};
 		std::chrono::milliseconds jitter_decay_interval{4000};
 
+		// Transport selection: 0 = UDP, 1 = TCP.
+		int connection_mode = 0;
+		bool advanced_settings = false;
+
+		// UDP transport.
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
+
+		// TCP transport. Host is an N-way hub; Client keeps one connection to Host.
+		bool tcp_is_host = true;
+		int tcp_port = 7500;
+		std::string tcp_host_ip = "127.0.0.1";
+		std::string tcp_bind_ip = "0.0.0.0";
+		std::mutex tcp_sock_lock;
+		socket_t tcp_listen_sock = UEPCB_INVALID_SOCKET;
+		std::mutex tcp_peers_lock;
+		std::vector<socket_t> tcp_peers;
+
 		std::thread recv_thread;
 		std::atomic<bool> thread_stop{false};
 	} UePcbState;
@@ -279,8 +338,9 @@ namespace usb_uepcb
 		return k;
 	}
 
-	// Jitter parameters are per-instance so the Settings UI can tune them
-	// without recompiling. Defaults: Grace=3ms, Decay=4000ms, Min=1, Max=4, Queue=8.
+	// Adaptive jitter parameters are stored per UePcbState in 1.3.3 so they
+	// can be tuned from the USB settings UI without recompiling. Defaults
+	// remain Grace=3ms, Decay=4000ms, MinTarget=1, MaxTarget=4, Queue=8.
 
 	static bool seq_before(u32 a, u32 b)
 	{
@@ -325,11 +385,19 @@ namespace usb_uepcb
 				jb.diag_max_ahead = ahead;
 		}
 
-		// target_packets is NOT touched here. An out-of-order arrival is
-		// usually a harmless, self-resolving 1-packet swap (common on Wi-Fi);
-		// growing the buffer only happens in jitter_promote(), when a gap's
-		// grace period genuinely expires. gap_active/gap_since are tracked
-		// solely there too, so this function doesn't touch them.
+		// Claude UePcb 1.3: target_packets is deliberately NOT touched here
+		// anymore. A packet simply arriving out of order (seq != jb.next_seq)
+		// is the ordinary case of two adjacent UDP datagrams swapping order
+		// by a couple of milliseconds - real Wi-Fi links do this constantly,
+		// and it self-resolves almost immediately. In 1.2 this bumped the
+		// buffer target on every such event, which measured test logs showed
+		// pinned target_packets at its max within the first ~10-40 seconds
+		// of every match and kept it there almost the whole game. Growing
+		// the buffer only happens in jitter_promote() now, at the point a
+		// gap's grace period genuinely expires - i.e. only when growing the
+		// buffer would actually have helped. gap_active/gap_since are also
+		// tracked solely in jitter_promote() now (single source of truth
+		// for that countdown), so they're not touched here either.
 
 		// Never allow an unbounded backlog.
 		if (jb.packets.size() >= s->jitter_max_packets)
@@ -358,8 +426,11 @@ namespace usb_uepcb
 			u32 selected_seq = 0;
 			std::chrono::steady_clock::time_point selected_arrival{};
 			bool selected = false;
-			// True only when giving up on a packet still missing after its
-			// grace period - real evidence the buffer needs to be deeper.
+			// Claude UePcb 1.3: true only when we're giving up on a packet
+			// that's still missing after its grace period - i.e. real
+			// evidence that the current target_packets wasn't deep enough.
+			// False for the ordinary "next packet was already sitting
+			// there" case, even if it arrived slightly out of send order.
 			bool selected_is_forced_skip = false;
 
 			const auto now = std::chrono::steady_clock::now();
@@ -484,9 +555,10 @@ namespace usb_uepcb
 			}
 			else
 			{
-				// Time-based decay: relax by one step once calm for
-				// jitter_decay_interval, instead of needing N consecutive
-				// perfect deliveries that one hiccup would reset to zero.
+				// Time-based decay: relax by one step once it's genuinely
+				// been calm for s->jitter_decay_interval, rather than requiring
+				// N consecutive perfect deliveries that any single hiccup
+				// would reset to zero.
 				const auto since_change =
 					std::chrono::duration_cast<std::chrono::milliseconds>(now - jb.last_target_change);
 
@@ -501,6 +573,241 @@ namespace usb_uepcb
 				}
 			}
 		}
+	}
+
+
+	static bool tcp_recv_exact(socket_t c, u8* buf, int len)
+	{
+		int off = 0;
+		while (off < len)
+		{
+			const int n = recv(c, reinterpret_cast<char*>(buf + off), len - off, 0);
+			if (n <= 0)
+				return false;
+			off += n;
+		}
+		return true;
+	}
+
+	static bool tcp_send_exact(socket_t c, const u8* buf, int len)
+	{
+		int off = 0;
+		while (off < len)
+		{
+			const int n = send(c, reinterpret_cast<const char*>(buf + off), len - off, 0);
+			if (n <= 0)
+				return false;
+			off += n;
+		}
+		return true;
+	}
+
+	static bool tcp_send_frame(socket_t c, const u8* eth, int len)
+	{
+		if (c == UEPCB_INVALID_SOCKET || len < 14 || len > 2048)
+			return false;
+		const u8 hdr[4] = {
+			static_cast<u8>((len >> 24) & 0xff), static_cast<u8>((len >> 16) & 0xff),
+			static_cast<u8>((len >> 8) & 0xff), static_cast<u8>(len & 0xff)};
+		return tcp_send_exact(c, hdr, 4) && tcp_send_exact(c, eth, len);
+	}
+
+	static void tcp_push_received_frame(UePcbState* s, const u8* eth, int len)
+	{
+		// IMPORTANT: use the fixed AN986 BULK IN wrapper shared with UDP.
+		// Odd Ethernet lengths are padded to an even boundary before the 8-byte
+		// status trailer, and the 2-byte reported length includes that pad.
+		std::lock_guard<std::mutex> lk(s->in_lock);
+		if (s->in_q.size() >= 64)
+			s->in_q.pop_front();
+		s->in_q.push_back(to_bulkin(eth, len));
+	}
+
+	static void tcp_remove_peer(UePcbState* s, socket_t p)
+	{
+		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+		for (auto it = s->tcp_peers.begin(); it != s->tcp_peers.end(); ++it)
+		{
+			if (*it == p)
+			{
+				s->tcp_peers.erase(it);
+				break;
+			}
+		}
+		sock_close(p);
+	}
+
+	static void tcp_host_flood(UePcbState* s, socket_t src, const u8* eth, int len)
+	{
+		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+		for (socket_t p : s->tcp_peers)
+		{
+			if (p != src && p != UEPCB_INVALID_SOCKET)
+				tcp_send_frame(p, eth, len);
+		}
+	}
+
+	static void tcp_send_packet(UePcbState* s, const u8* eth, int len)
+	{
+		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+		for (socket_t p : s->tcp_peers)
+		{
+			if (p != UEPCB_INVALID_SOCKET)
+				tcp_send_frame(p, eth, len);
+		}
+	}
+
+	static void tcp_client_recv_loop(UePcbState* s, socket_t conn)
+	{
+		while (!s->thread_stop)
+		{
+			u8 hdr[4];
+			if (!tcp_recv_exact(conn, hdr, 4))
+				break;
+			const u32 ln = (static_cast<u32>(hdr[0]) << 24) | (static_cast<u32>(hdr[1]) << 16) |
+				(static_cast<u32>(hdr[2]) << 8) | static_cast<u32>(hdr[3]);
+			if (ln < 14 || ln > 2048)
+				break;
+			std::vector<u8> eth(ln);
+			if (!tcp_recv_exact(conn, eth.data(), static_cast<int>(ln)))
+				break;
+			tcp_push_received_frame(s, eth.data(), static_cast<int>(ln));
+		}
+	}
+
+	static void tcp_client_loop(UePcbState* s)
+	{
+		while (!s->thread_stop)
+		{
+			socket_t conn = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (conn != UEPCB_INVALID_SOCKET)
+			{
+				sockaddr_in a{};
+				a.sin_family = AF_INET;
+				a.sin_port = htons(static_cast<u16>(s->tcp_port));
+				if (inet_pton(AF_INET, s->tcp_host_ip.c_str(), &a.sin_addr) == 1 &&
+					connect(conn, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0)
+				{
+					int nd = 1;
+					setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
+					{
+						std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+						s->tcp_peers.assign(1, conn);
+					}
+					Console.WriteLn("UePcb: TCP CLIENT connected %s:%d", s->tcp_host_ip.c_str(), s->tcp_port);
+					tcp_client_recv_loop(s, conn);
+					{
+						std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+						if (!s->tcp_peers.empty() && s->tcp_peers[0] == conn)
+							s->tcp_peers.clear();
+					}
+					sock_close(conn);
+				}
+				else
+					sock_close(conn);
+			}
+			for (int i = 0; i < 20 && !s->thread_stop; ++i)
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+	}
+
+	static void tcp_host_loop(UePcbState* s)
+	{
+		socket_t ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (ls == UEPCB_INVALID_SOCKET)
+			return;
+		int one = 1;
+		setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_port = htons(static_cast<u16>(s->tcp_port));
+		if (inet_pton(AF_INET, s->tcp_bind_ip.c_str(), &a.sin_addr) != 1 ||
+			bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
+		{
+			Console.Error("UePcb: TCP HOST bind %s:%d FAILED", s->tcp_bind_ip.c_str(), s->tcp_port);
+			sock_close(ls);
+			return;
+		}
+		listen(ls, 8);
+		{
+			std::lock_guard<std::mutex> lk(s->tcp_sock_lock);
+			s->tcp_listen_sock = ls;
+		}
+		Console.WriteLn("UePcb: TCP HOST listening %s:%d", s->tcp_bind_ip.c_str(), s->tcp_port);
+
+		while (!s->thread_stop)
+		{
+			fd_set rf;
+			FD_ZERO(&rf);
+			FD_SET(ls, &rf);
+			socket_t maxfd = ls;
+			std::vector<socket_t> snap;
+			{
+				std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+				snap = s->tcp_peers;
+			}
+			for (socket_t p : snap)
+			{
+				FD_SET(p, &rf);
+#ifndef _WIN32
+				if (p > maxfd) maxfd = p;
+#endif
+			}
+			timeval tv{0, 200000};
+			const int r = select(static_cast<int>(maxfd) + 1, &rf, nullptr, nullptr, &tv);
+			if (s->thread_stop)
+				break;
+			if (r <= 0)
+				continue;
+
+			if (FD_ISSET(ls, &rf))
+			{
+				socket_t conn = accept(ls, nullptr, nullptr);
+				if (conn != UEPCB_INVALID_SOCKET)
+				{
+					int nd = 1;
+					setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
+					std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+					s->tcp_peers.push_back(conn);
+					Console.WriteLn("UePcb: TCP peer connected (%d total)", static_cast<int>(s->tcp_peers.size()));
+				}
+			}
+
+			for (socket_t p : snap)
+			{
+				if (!FD_ISSET(p, &rf))
+					continue;
+				u8 hdr[4];
+				if (!tcp_recv_exact(p, hdr, 4))
+				{
+					tcp_remove_peer(s, p);
+					continue;
+				}
+				const u32 ln = (static_cast<u32>(hdr[0]) << 24) | (static_cast<u32>(hdr[1]) << 16) |
+					(static_cast<u32>(hdr[2]) << 8) | static_cast<u32>(hdr[3]);
+				if (ln < 14 || ln > 2048)
+				{
+					tcp_remove_peer(s, p);
+					continue;
+				}
+				std::vector<u8> eth(ln);
+				if (!tcp_recv_exact(p, eth.data(), static_cast<int>(ln)))
+				{
+					tcp_remove_peer(s, p);
+					continue;
+				}
+				tcp_push_received_frame(s, eth.data(), static_cast<int>(ln));
+				tcp_host_flood(s, p, eth.data(), static_cast<int>(ln));
+			}
+		}
+	}
+
+	static void tcp_transport_loop(UePcbState* s)
+	{
+		if (s->tcp_is_host)
+			tcp_host_loop(s);
+		else
+			tcp_client_loop(s);
 	}
 
 	static void udp_recv_loop(UePcbState* s)
@@ -608,8 +915,10 @@ namespace usb_uepcb
 		if (len + kWireTrailerSize > 2048)
 			return;
 
-		// Build the wire packet once (frame + seq) and reuse for every
-		// destination - all peers should see the same seq stream from us.
+		// Build the wire packet once (eth frame + trailing seq number) and
+		// reuse it for every destination, instead of re-touching the
+		// sequence counter per peer - all peers should see the same seq
+		// stream from us, not a separate counter each.
 		u8 wire[2048];
 		std::memcpy(wire, eth, len);
 		const u32 seq = s->tx_seq.fetch_add(1, std::memory_order_relaxed);
@@ -724,9 +1033,10 @@ namespace usb_uepcb
 			}
 		}
 
-		// AN986.IRX only drives Bulk OUT on EP2 / Bulk IN on EP1 (no
-		// sceUsbdInterruptTransfer import); reject anything else instead of
-		// treating an unexpected endpoint as ethernet traffic.
+		// AN986.IRX only ever drives Bulk OUT on EP2 and Bulk IN on EP1; EP3 is
+		// descriptor-compatible but unused (no sceUsbdInterruptTransfer import
+		// in the driver). Reject anything else instead of silently treating an
+		// unexpected endpoint as ethernet traffic.
 		const u8 ep = p->ep ? p->ep->nr : 0;
 
 		switch (p->pid)
@@ -760,8 +1070,11 @@ namespace usb_uepcb
 					std::memcpy(buf, s->tx_accum.data(), n);
 					s->tx_accum.erase(s->tx_accum.begin(), s->tx_accum.begin() + total);
 
-					// 發送 UDP 封包（廣播或直連 Peer 清單）
-					udp_send_packet(s, buf + 2, ethlen);
+					// Transport send: UDP mesh/broadcast or TCP hub/client.
+					if (s->connection_mode == 1)
+						tcp_send_packet(s, buf + 2, ethlen);
+					else
+						udp_send_packet(s, buf + 2, ethlen);
 				}
 				break;
 			}
@@ -769,8 +1082,9 @@ namespace usb_uepcb
 			{
 				if (ep == 3)
 				{
-					// No interrupt transfer in the driver - NAK fits better
-					// than fabricating a status packet.
+					// No sceUsbdInterruptTransfer import is present in
+					// AN986.IRX - NAK is closer to actual driver usage than
+					// fabricating an interrupt status packet.
 					p->status = USB_RET_NAK;
 					break;
 				}
@@ -779,8 +1093,13 @@ namespace usb_uepcb
 					p->status = USB_RET_STALL;
 					break;
 				}
-				// Adaptively reorder a small amount of UDP jitter, only when
-				// the emulated USB IN endpoint is actually polled.
+				if (s->connection_mode == 0)
+				{
+				// Promote a bounded batch only when the emulated USB controller
+				// actually polls the IN endpoint. No peer is waited for and no
+				// artificial delay is introduced.
+				// Adaptively reorder a small amount of UDP jitter only when the
+				// emulated USB IN endpoint is actually polled.
 				jitter_promote(s);
 
 				{
@@ -793,6 +1112,7 @@ namespace usb_uepcb
 						s->pending_rx.pop_front();
 						++moved;
 					}
+				}
 				}
 				if (!s->rx_partial.empty())
 				{
@@ -844,16 +1164,31 @@ namespace usb_uepcb
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
 		s->thread_stop = true;
+
 		if (s->udp_sock != UEPCB_INVALID_SOCKET)
 		{
 			sock_close(s->udp_sock);
 			s->udp_sock = UEPCB_INVALID_SOCKET;
 		}
+		{
+			std::lock_guard<std::mutex> lk(s->tcp_sock_lock);
+			if (s->tcp_listen_sock != UEPCB_INVALID_SOCKET)
+			{
+				sock_close(s->tcp_listen_sock);
+				s->tcp_listen_sock = UEPCB_INVALID_SOCKET;
+			}
+		}
+		{
+			std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+			for (socket_t p : s->tcp_peers)
+				if (p != UEPCB_INVALID_SOCKET)
+					sock_close(p);
+			s->tcp_peers.clear();
+		}
 		if (s->recv_thread.joinable())
 			s->recv_thread.join();
 
-		// 1.3.3 end-of-session diagnostics. Printed only during device teardown
-		// so normal packet processing gets no periodic logging overhead.
+		if (s->connection_mode == 0)
 		{
 			std::lock_guard<std::mutex> lock(s->jitter_lock);
 			for (const auto& entry : s->peer_jitter)
@@ -871,7 +1206,6 @@ namespace usb_uepcb
 					jb.diag_max_ahead, jb.target_packets, jb.packets.size());
 			}
 		}
-
 		delete s;
 	}
 
@@ -880,16 +1214,24 @@ namespace usb_uepcb
 		wsa_ensure();
 		UePcbState* s = new UePcbState();
 		{
-			s->broadcast_ip = USB::GetConfigString(si, port, TypeName(), "TargetIP", "255.255.255.255");
+			s->connection_mode = std::clamp(USB::GetConfigInt(si, port, TypeName(), "ConnectionMode", 0), 0, 1);
+			s->advanced_settings = USB::GetConfigBool(si, port, TypeName(), "AdvancedSettings", false);
+			s->broadcast_ip = s->advanced_settings ?
+				USB::GetConfigString(si, port, TypeName(), "TargetIP", "255.255.255.255") : "255.255.255.255";
 			s->udp_port = USB::GetConfigInt(si, port, TypeName(), "Port", 7500);
+			s->tcp_port = s->udp_port;
+			s->tcp_is_host = (USB::GetConfigInt(si, port, TypeName(), "TCPRole", 0) == 0);
+			s->tcp_bind_ip = USB::GetConfigString(si, port, TypeName(), "TCPBindIP", "0.0.0.0");
+			s->tcp_host_ip = USB::GetConfigString(si, port, TypeName(), "TCPHostIP", "127.0.0.1");
+			const int tcp_history_slot = USB::GetConfigInt(si, port, TypeName(), "TCPHostHistorySlot", 0);
 
 			// 1.3.3 manual adaptive jitter tuning. Clamp values defensively so a
 			// typo cannot create an unbounded queue or excessive wait.
-			const int grace_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterGraceMs", 3), 0, 20);
-			const int decay_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterDecayMs", 4000), 250, 60000);
-			const int min_target = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMinTarget", 1), 1, 8);
-			const int max_target = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxTarget", 4), min_target, 8);
-			const int max_packets = std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxPackets", 8), max_target, 32);
+			const int grace_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterGraceMs", 3), 0, 20) : 3;
+			const int decay_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterDecayMs", 4000), 250, 60000) : 4000;
+			const int min_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMinTarget", 1), 1, 8) : 1;
+			const int max_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxTarget", 4), min_target, 8) : 4;
+			const int max_packets = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxPackets", 8), max_target, 32) : 8;
 			s->jitter_grace = std::chrono::milliseconds(grace_ms);
 			s->jitter_decay_interval = std::chrono::milliseconds(decay_ms);
 			s->jitter_min_target = static_cast<u32>(min_target);
@@ -898,8 +1240,9 @@ namespace usb_uepcb
 			Console.WriteLn("UePcb: Jitter tuning Grace=%dms Decay=%dms Min=%d Max=%d Queue=%d",
 				grace_ms, decay_ms, min_target, max_target, max_packets);
 
-			// Shared Peer IP history. Boolean checkboxes for Remember/Clear;
-			// peer selection is a numeric slot shown as text in the combo.
+			// 1.3.3 shared Peer IP history. Boolean is now confirmed for native
+			// Remember/Clear checkboxes; peer history selection remains numeric
+			// until a dynamic editable list UI is intentionally added later.
 			static constexpr int kHistorySlots = 10;
 			std::array<std::string, kHistorySlots> history{};
 			for (int i = 0; i < kHistorySlots; ++i)
@@ -907,6 +1250,9 @@ namespace usb_uepcb
 				const std::string key = "History" + std::to_string(i + 1);
 				history[i] = USB::GetConfigString(si, port, TypeName(), key.c_str(), "");
 			}
+
+			if (tcp_history_slot >= 1 && tcp_history_slot <= kHistorySlots && !history[tcp_history_slot - 1].empty())
+				s->tcp_host_ip = history[tcp_history_slot - 1];
 
 			const std::string config_section = "USB" + std::to_string(port + 1);
 			const auto real_key = [this](const std::string& key) {
@@ -928,6 +1274,8 @@ namespace usb_uepcb
 					const std::string key = "Peer" + std::to_string(i + 1) + "HistorySlot";
 					si.SetUIntValue(config_section.c_str(), real_key(key).c_str(), 0);
 				}
+				si.SetUIntValue(config_section.c_str(), real_key("TCPHostHistorySlot").c_str(), 0);
+				s->tcp_host_ip = USB::GetConfigString(si, port, TypeName(), "TCPHostIP", "127.0.0.1");
 				si.SetBoolValue(config_section.c_str(), real_key("ClearIPHistory").c_str(), false);
 				Console.WriteLn("UePcb: shared Peer IP history cleared");
 			}
@@ -963,9 +1311,13 @@ namespace usb_uepcb
 					updated[used++] = ip;
 				};
 
-				// Current resolved Peer IPs become the MRU entries.
-				for (const std::string& ip : s->peer_ips)
-					add_unique(ip);
+				// Current resolved addresses become MRU entries. UDP stores Peer1-3;
+				// TCP Client stores the Host IP in the same shared history pool.
+				if (s->connection_mode == 1 && !s->tcp_is_host)
+					add_unique(s->tcp_host_ip);
+				else
+					for (const std::string& ip : s->peer_ips)
+						add_unique(ip);
 				for (const std::string& ip : history)
 					add_unique(ip);
 
@@ -1007,6 +1359,8 @@ namespace usb_uepcb
 				s->mac[5] = static_cast<u8>((r >> 16) & 0xFF);
 			}
 
+			if (s->connection_mode == 0)
+			{
 			s->udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 			if (s->udp_sock != UEPCB_INVALID_SOCKET)
 			{
@@ -1014,9 +1368,13 @@ namespace usb_uepcb
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
 
-				// Bigger kernel receive buffer: under a burst (host stalls a
-				// frame), a small buffer overflows and silently drops
-				// datagrams before udp_recv_loop() ever reads them.
+				// Give the kernel receive buffer more headroom than the tiny
+				// OS default. Under a burst (host briefly stalls a frame,
+				// e.g. a hitch from disk I/O or GC), a small kernel buffer
+				// overflows and silently drops datagrams before
+				// udp_recv_loop() ever reads them - a loss that's invisible
+				// even to the new seq-gap logging above, since the packet
+				// never reaches userland at all.
 				int rcvbuf = 256 * 1024;
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 
@@ -1027,6 +1385,15 @@ namespace usb_uepcb
 
 				bind(s->udp_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr));
 			}
+			}
+			else
+			{
+				Console.WriteLn("UePcb: TCP mode role=%s port=%d %s=%s",
+					s->tcp_is_host ? "HOST" : "CLIENT", s->tcp_port,
+					s->tcp_is_host ? "listen" : "host",
+					s->tcp_is_host ? s->tcp_bind_ip.c_str() : s->tcp_host_ip.c_str());
+			}
+
 		}
 
 		s->dev.speed = USB_SPEED_FULL;
@@ -1049,7 +1416,7 @@ namespace usb_uepcb
 		usb_desc_init(&s->dev);
 		usb_ep_init(&s->dev);
 		uepcb_handle_reset(&s->dev);
-		s->recv_thread = std::thread(udp_recv_loop, s);
+		s->recv_thread = (s->connection_mode == 1) ? std::thread(tcp_transport_loop, s) : std::thread(udp_recv_loop, s);
 		return &s->dev;
 
 	fail:
@@ -1057,7 +1424,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - Claude UePcb 1.4.1)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.5"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1072,108 +1439,58 @@ namespace usb_uepcb
 
 	std::span<const SettingInfo> UePcbDevice::Settings(u32 subtype) const
 	{
+		static const char* connection_modes[] = {"UDP", "TCP", nullptr};
+		static const char* tcp_roles[] = {"Host", "Client", nullptr};
 		static const SettingInfo settings[] = {
-			{.type = SettingInfo::Type::String,
-				.name = "TargetIP",
-				.display_name = "Target Broadcast / Subnet IP (LAN Mode)",
-				.description = "Used when Direct Peer IPs are empty. Default: 255.255.255.255",
-				.default_value = "255.255.255.255"},
-			{.type = SettingInfo::Type::Integer,
-				.name = "Port",
-				.display_name = "UDP Port",
-				.description = "UDP port for LAN / Internet P2P communication (Default: 7500).",
-				.default_value = "7500",
-				.min_value = "1",
-				.max_value = "65535",
-				.step_value = "1"},
+			{.type = SettingInfo::Type::IntegerList, .name = "ConnectionMode", .display_name = "Connection Mode",
+				.description = "UDP is the low-latency Direct Peer/Broadcast mode. TCP uses a Host/Client hub.",
+				.default_value = "0", .min_value = "0", .options = connection_modes},
+			{.type = SettingInfo::Type::Integer, .name = "Port", .display_name = "Network Port",
+				.description = "UDP or TCP port used by every player. Default: 7500.",
+				.default_value = "7500", .min_value = "1", .max_value = "65535", .step_value = "1"},
 
-			{.type = SettingInfo::Type::String,
-				.name = "Peer1IP",
-				.display_name = "Direct Peer 1 IP (Manual)",
-				.description = "Manual IPv4 address. Used when Peer 1 History Slot is 0.",
-				.default_value = ""},
-			{.type = SettingInfo::Type::Integer,
-				.name = "Peer1HistorySlot",
-				.display_name = "Peer 1 History Slot (0=Manual, 1-10=Saved)",
-				.description = "Select a shared saved IP. 0 uses Direct Peer 1 IP above.",
-				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::String, .name = "TargetIP", .display_name = "Broadcast Address",
+				.description = "UDP only. Used when all Direct Peer IPs are empty. Default: 255.255.255.255.", .default_value = "255.255.255.255"},
+			{.type = SettingInfo::Type::String, .name = "Peer1IP", .display_name = "Direct Peer 1 IP", .description = "UDP manual peer address.", .default_value = ""},
+			{.type = SettingInfo::Type::Integer, .name = "Peer1HistorySlot", .display_name = "Peer 1 Saved IP", .description = "0=Manual, 1-10=saved.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::String, .name = "Peer2IP", .display_name = "Direct Peer 2 IP", .description = "UDP manual peer address.", .default_value = ""},
+			{.type = SettingInfo::Type::Integer, .name = "Peer2HistorySlot", .display_name = "Peer 2 Saved IP", .description = "0=Manual, 1-10=saved.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::String, .name = "Peer3IP", .display_name = "Direct Peer 3 IP", .description = "UDP manual peer address.", .default_value = ""},
+			{.type = SettingInfo::Type::Integer, .name = "Peer3HistorySlot", .display_name = "Peer 3 Saved IP", .description = "0=Manual, 1-10=saved.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
 
-			{.type = SettingInfo::Type::String,
-				.name = "Peer2IP",
-				.display_name = "Direct Peer 2 IP (Manual)",
-				.description = "Manual IPv4 address. Used when Peer 2 History Slot is 0.",
-				.default_value = ""},
-			{.type = SettingInfo::Type::Integer,
-				.name = "Peer2HistorySlot",
-				.display_name = "Peer 2 History Slot (0=Manual, 1-10=Saved)",
-				.description = "Select the same shared history pool as Peer 1.",
-				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::IntegerList, .name = "TCPRole", .display_name = "TCP Role",
+				.description = "Host listens and relays frames to all Clients. Client connects to the Host.", .default_value = "0", .min_value = "0", .options = tcp_roles},
+			{.type = SettingInfo::Type::String, .name = "TCPBindIP", .display_name = "Listen IP",
+				.description = "TCP Host only. 0.0.0.0 listens on all LAN/VPN adapters; 127.0.0.1 limits it to this PC.", .default_value = "0.0.0.0"},
+			{.type = SettingInfo::Type::String, .name = "TCPHostIP", .display_name = "TCP Host IP",
+				.description = "TCP Client only. Same PC: 127.0.0.1. LAN/VPN: enter the Host machine's LAN or VPN IP.", .default_value = "127.0.0.1"},
+			{.type = SettingInfo::Type::Integer, .name = "TCPHostHistorySlot", .display_name = "TCP Host Saved IP",
+				.description = "0=Manual TCP Host IP, 1-10=shared saved address.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
 
-			{.type = SettingInfo::Type::String,
-				.name = "Peer3IP",
-				.display_name = "Direct Peer 3 IP (Manual)",
-				.description = "Manual IPv4 address. Used when Peer 3 History Slot is 0.",
-				.default_value = ""},
-			{.type = SettingInfo::Type::Integer,
-				.name = "Peer3HistorySlot",
-				.display_name = "Peer 3 History Slot (0=Manual, 1-10=Saved)",
-				.description = "Select the same shared history pool as Peer 1 and Peer 2.",
-				.default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::Boolean, .name = "RememberCurrentIPs", .display_name = "Remember Current IPs",
+				.description = "Check and Apply/Save. UDP remembers resolved Peer1-3; TCP Client remembers the Host IP. Resets automatically.", .default_value = "false"},
+			{.type = SettingInfo::Type::Boolean, .name = "ClearIPHistory", .display_name = "Clear Shared IP History",
+				.description = "Check and Apply/Save to clear all 10 saved IPs and reset selectors to Manual. Resets automatically.", .default_value = "false"},
 
-			{.type = SettingInfo::Type::Boolean,
-				.name = "RememberCurrentIPs",
-				.display_name = "Remember Current Peer IPs",
-				.description = "Check and Apply. Current resolved Peer1-3 IPs are moved to the front of the shared 10-entry history, duplicates removed; it unchecks automatically.",
-				.default_value = "false"},
-			{.type = SettingInfo::Type::Boolean,
-				.name = "ClearIPHistory",
-				.display_name = "Clear Shared IP History",
-				.description = "Check and Apply to clear all 10 saved IPs and reset Peer history selectors to Manual. It unchecks automatically.",
-				.default_value = "false"},
+			{.type = SettingInfo::Type::String, .name = "History1", .display_name = "Saved IP 1", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History2", .display_name = "Saved IP 2", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History3", .display_name = "Saved IP 3", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History4", .display_name = "Saved IP 4", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History5", .display_name = "Saved IP 5", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History6", .display_name = "Saved IP 6", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History7", .display_name = "Saved IP 7", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History8", .display_name = "Saved IP 8", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History9", .display_name = "Saved IP 9", .description = "Hidden history storage.", .default_value = ""},
+			{.type = SettingInfo::Type::String, .name = "History10", .display_name = "Saved IP 10", .description = "Hidden history storage.", .default_value = ""},
 
-			{.type = SettingInfo::Type::String, .name = "History1", .display_name = "Saved IP 1 (Newest)", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History2", .display_name = "Saved IP 2", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History3", .display_name = "Saved IP 3", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History4", .display_name = "Saved IP 4", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History5", .display_name = "Saved IP 5", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History6", .display_name = "Saved IP 6", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History7", .display_name = "Saved IP 7", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History8", .display_name = "Saved IP 8", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History9", .display_name = "Saved IP 9", .description = "Shared Peer IP history entry.", .default_value = ""},
-			{.type = SettingInfo::Type::String, .name = "History10", .display_name = "Saved IP 10 (Oldest)", .description = "Shared Peer IP history entry.", .default_value = ""},
-
-			// Adaptive jitter tuning. Defaults exactly match 1.3/1.3.1.
-			{.type = SettingInfo::Type::Integer,
-				.name = "JitterGraceMs",
-				.display_name = "Jitter Grace (ms)",
-				.description = "Grace window for a missing sequence before forced skip. Default 3 ms. Suggested test range: 2-6 ms.",
-				.default_value = "3", .min_value = "0", .max_value = "20", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer,
-				.name = "JitterDecayMs",
-				.display_name = "Buffer Decay (ms)",
-				.description = "Stable time before target buffer relaxes by one step. Default 4000 ms. Try 8000 or 12000 for smoother behavior.",
-				.default_value = "4000", .min_value = "250", .max_value = "60000", .step_value = "250"},
-			{.type = SettingInfo::Type::Integer,
-				.name = "JitterMinTarget",
-				.display_name = "Minimum Target Buffer (packets)",
-				.description = "Minimum adaptive target depth. Default 1. Leave at 1 for normal testing.",
-				.default_value = "1", .min_value = "1", .max_value = "8", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer,
-				.name = "JitterMaxTarget",
-				.display_name = "Maximum Target Buffer (packets)",
-				.description = "Maximum adaptive target depth. Default 4. Leave at 4 initially.",
-				.default_value = "4", .min_value = "1", .max_value = "8", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer,
-				.name = "JitterMaxPackets",
-				.display_name = "Maximum Jitter Queue (packets)",
-				.description = "Hard per-peer jitter queue limit. Default 8. Keep small to avoid latency buildup.",
-				.default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
-
-			{.type = SettingInfo::Type::String,
-				.name = "MacHex",
-				.display_name = "MAC 12-hex (optional override)",
-				.description = "Leave BLANK - auto generates unique MAC per emulator.",
-				.default_value = ""}};
+			{.type = SettingInfo::Type::Boolean, .name = "AdvancedSettings", .display_name = "Advanced Settings",
+				.description = "Enable manual UDP jitter tuning. When disabled, the proven defaults are forced: Grace 3, Decay 4000, Min 1, Max 4, Queue 8.", .default_value = "false"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterGraceMs", .display_name = "Jitter Grace (ms)", .description = "UDP only. Missing-sequence grace before forced skip.", .default_value = "3", .min_value = "0", .max_value = "20", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterDecayMs", .display_name = "Buffer Decay (ms)", .description = "UDP only. Stable time before target buffer relaxes by one.", .default_value = "4000", .min_value = "250", .max_value = "60000", .step_value = "250"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterMinTarget", .display_name = "Minimum Target Buffer", .description = "UDP only. Default 1.", .default_value = "1", .min_value = "1", .max_value = "8", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 4.", .default_value = "4", .min_value = "1", .max_value = "8", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterMaxPackets", .display_name = "Maximum Jitter Queue", .description = "UDP only. Default 8; keep small to avoid latency buildup.", .default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
+			{.type = SettingInfo::Type::String, .name = "MacHex", .display_name = "MAC 12-hex", .description = "Leave blank to auto-generate a unique MAC per emulator instance.", .default_value = ""}};
 		return settings;
 	}
 
