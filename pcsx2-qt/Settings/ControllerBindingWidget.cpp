@@ -587,9 +587,8 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-	// UE PCB 1.4 compact custom layout. History1..History10 remain persisted
-	// settings, but are intentionally hidden here and exposed through the three
-	// history dropdowns instead. This does not affect other USB device UIs.
+	// UE PCB uses a compact custom layout; History1-10 stay hidden and are
+	// exposed via the three history dropdowns instead.
 	if (m_config_prefix == "UePcb_")
 	{
 		layout->setColumnStretch(1, 1);
@@ -604,6 +603,9 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			if (f.pointSizeF() > 0.0)
 				f.setPointSizeF(f.pointSizeF() * 0.90);
 			desc->setFont(f);
+			// No forced color here - a hardcoded dark gray was unreadable
+			// against a dark theme. Smaller font is enough to read as a
+			// sub-label while staying visible in any theme.
 			layout->addWidget(desc, row, 0, 1, 4);
 		};
 
@@ -651,7 +653,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		addString("TargetIP", tr("Target Broadcast"), "255.255.255.255", current_row, 0);
 		addInt("Port", tr("UDP Port"), 7500, 1, 65535, 1, current_row, 2);
 		current_row++;
-		makeSmallDescription(tr("Target Broadcast is used for LAN broadcast mode only when all three Direct Peer IPs are empty. The default 255.255.255.255 broadcasts to the local network. UDP Port is the port used by every UEPCB peer for LAN, VPN or Internet P2P communication; keep all players on the same port (default 7500)."), current_row++);
+		makeSmallDescription(tr("Broadcast is used only when all Direct Peer IPs are empty. Default UDP port: 7500."), current_row++);
 
 		for (int peer = 1; peer <= 3; peer++)
 		{
@@ -659,7 +661,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			addHistoryCombo(peer, current_row);
 			current_row++;
 		}
-		makeSmallDescription(tr("For each peer, choose Manual to use the Direct Peer IP field, or choose a Saved IP entry from the shared 10-slot history. In a 4-player game, each PC only needs the other three players; do not enter the local machine's own IP. Leaving all Direct Peer IPs empty returns UEPCB to broadcast mode."), current_row++);
+		makeSmallDescription(tr("Choose Manual to use the IP field, or choose one of the shared saved-IP slots."), current_row++);
 
 		QCheckBox* remember = new QCheckBox(tr("Remember Current Peer IPs"), widget_parent);
 		remember->setObjectName(QStringLiteral("RememberCurrentIPs"));
@@ -672,7 +674,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			sif, clear, m_config_section, m_config_prefix + "ClearIPHistory", false);
 		layout->addWidget(clear, current_row, 2, 1, 2);
 		current_row++;
-		makeSmallDescription(tr("Remember Current Peer IPs: check it and Apply/Save settings to store the currently resolved Peer 1-3 addresses in the shared 10-entry history. New/recent addresses move to the front and duplicates are removed; the checkbox resets automatically. Clear Shared IP History: check it and Apply/Save to erase all 10 saved addresses and return all peer selectors to Manual; it also resets automatically."), current_row++);
+		makeSmallDescription(tr("Remember moves the current Peer 1-3 IPs to the front of the shared 10-entry history. Clear removes all saved IPs."), current_row++);
 
 		addInt("JitterGraceMs", tr("Jitter Grace (ms)"), 3, 0, 20, 1, current_row, 0);
 		addInt("JitterDecayMs", tr("Buffer Decay (ms)"), 4000, 250, 60000, 250, current_row, 2);
@@ -683,7 +685,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		addInt("JitterMaxPackets", tr("Maximum Jitter Queue"), 8, 1, 32, 1, current_row, 0);
 		addString("MacHex", tr("MAC 12-hex"), "", current_row, 2);
 		current_row++;
-		makeSmallDescription(tr("Jitter Grace controls how long a missing sequence may recover before a forced skip (default 3 ms). Buffer Decay controls how long stable playback must continue before the adaptive target buffer drops by one step (default 4000 ms; 8000-12000 ms are useful smoothness tests). Minimum/Maximum Target Buffer limit the adaptive playback depth (defaults 1/4). Maximum Jitter Queue is the hard per-peer holding limit (default 8); increasing it too far can accumulate latency. Leave MAC 12-hex blank so each emulator instance automatically generates a unique MAC address."), current_row++);
+		makeSmallDescription(tr("Defaults: Grace 3 ms, Decay 4000 ms, Min 1, Max 4, Queue 8. Leave MAC blank for automatic generation."), current_row++);
 
 		QHBoxLayout* bottom_hlayout = new QHBoxLayout();
 		QPushButton* restore_defaults = new QPushButton(tr("Restore Default Settings"), this);

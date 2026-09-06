@@ -1,41 +1,15 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.4 (Experimental Adaptive)
-// Based on: Claude UePcb 1.3
-//
-// 1.4 changes:
-//   - Polished compact two-column UEPCB settings UI (paired ControllerBindingWidget file).
-//   - History remains dropdown-based; History1..History10 stay hidden backend storage.
-//   - Description text now follows the active Qt theme for high contrast.
-//   - Expanded help text without changing synchronization/network behavior.
-//   - Keeps the 1.3.1 shared 10-slot Peer IP history pool.
-//   - Remember/Clear are native Boolean checkbox settings.
-//   - Grace/Decay/MinTarget/MaxTarget/MaxQueue are user-adjustable settings.
-//   - Defaults reproduce Claude 1.3/1.3.1 synchronization timing.
-//   - Recovered diagnostic now counts ahead-arriving packets later promoted in order.
-// Based on: usb-uepcb_fixed_udp_1_2_dynamic_buildfix.cpp
-//
-// Change from 1.2: the adaptive jitter buffer's grow/decay logic was
-// asymmetric in a way that real-world Wi-Fi test logs showed pins
-// target_packets at its maximum within the first ~10-40 seconds of a
-// match and keeps it there for 93-98% of the session, even on a run
-// where one side was on wired Ethernet. Root cause: jitter_insert() bumped
-// target_packets the instant ANY packet arrived out of the expected order
-// - including harmless, self-resolving 1-packet swaps, which measured
-// logs showed recurring every ~4-5 seconds on average - while recovery
-// required 120 consecutive perfectly-ordered deliveries (~6-7s at the
-// observed packet rate), a bar that was reset to zero by the very same
-// harmless events and so was essentially never reached.
-//
-// Fix in 1.3:
-//   1) target_packets now only grows in jitter_promote(), at the moment a
-//      missing packet's grace period genuinely expires (i.e. growing the
-//      buffer would actually have helped) - not the instant a reorder is
-//      first observed in jitter_insert().
-//   2) Decay is time-based (configured interval since the last forced
-//      skip) instead of a consecutive-success counter, so one isolated
-//      hiccup no longer wipes out an otherwise-clean multi-minute streak.
+// Claude UePcb 1.4.1
+// History: 1.2 -> Claude 1.3 (fixed jitter buffer grow/decay asymmetry that
+// pinned target_packets at max almost all match) -> 1.3.2 (user-adjustable
+// jitter settings + diagnostics) -> Claude 1.4 (Peer IP history UI; crashed
+// on a null SettingsInterface*) -> 1.3.3 fixed the crash by reading/writing
+// through m_dialog instead of sif directly -> 1.4.1 (this file): same fix,
+// diag_max_ahead uses an explicit if instead of std::max, comments trimmed,
+// and the settings-page description text no longer forces a hard-to-read
+// dark gray color.
 
 #include "USB/qemu-usb/qusb.h"
 #include "USB/qemu-usb/desc.h"
@@ -93,13 +67,11 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.3 (LAN + Direct UDP + Adaptive Jitter Buffer)", ""};
+		"", "Namco", "UE PCB v1.4.1 (LAN + Direct UDP + Adaptive Jitter Buffer)", ""};
 
-	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
-	// frame. This is purely an emulator-side addition (real UE PCB hardware
-	// never sees this - it only exists between PCSX2 instances), so it is
-	// safe to change the wire format freely. It lets us detect drops /
-	// reordering per-peer without touching the AN986 driver protocol at all.
+	// Wire trailer appended after the raw Ethernet frame in every UDP packet.
+	// Emulator-only addition (real hardware never sees this), so the wire
+	// format is safe to change; lets us detect per-peer drops/reordering.
 	static constexpr int kWireTrailerSize = sizeof(u32);
 
 	typedef struct UePcbState
@@ -112,9 +84,8 @@ namespace usb_uepcb
 		u8 eeprom_word = 0;
 		std::vector<u8> tx_accum;
 
-		// UDP receive thread writes to pending_rx. The USB IN handler promotes
-		// a small bounded batch at the USB polling boundary. This keeps network
-		// scheduling from directly changing the game-visible RX queue timing.
+		// pending_rx: buffer written by the UDP recv thread. USB IN promotes
+		// a bounded batch per poll so network timing doesn't leak into RX timing.
 		std::deque<std::vector<u8>> pending_rx;
 		std::mutex pending_lock;
 
@@ -133,20 +104,17 @@ namespace usb_uepcb
 		std::mutex in_lock;
 		std::deque<std::vector<u8>> in_q;
 
-		// Outgoing sequence counter, one per this instance. Peers use it to
-		// detect gaps in what they receive *from us*.
+		// tx_seq: per-packet outgoing sequence number, lets peers detect gaps.
 		std::atomic<u32> tx_seq{0};
 
-		// Per-peer bounded adaptive jitter buffers. Sequence numbers are used
-		// to restore order within each sender stream. The buffer is deliberately
-		// small so network trouble cannot turn into seconds of game latency.
+		// Per-peer bounded adaptive jitter buffers (restores send order, capped
+		// so network trouble can't turn into seconds of added game latency).
 		struct JitterPacket
 		{
 			u32 seq = 0;
 			std::vector<u8> data;
 			std::chrono::steady_clock::time_point arrival{};
-			// Diagnostic only: packet arrived ahead of the then-current playback point.
-			bool diag_was_ahead = false;
+			bool diag_was_ahead = false; // diagnostic only
 		};
 
 		struct PeerJitter
@@ -156,7 +124,7 @@ namespace usb_uepcb
 			bool seq_valid = false;
 			u32 target_packets = 1;
 
-			// 1.3.3 diagnostics only. These counters never affect playback timing.
+			// Diagnostics only, don't affect playback timing.
 			u64 diag_rx = 0;
 			u64 diag_ahead = 0;
 			u64 diag_recovered = 0;
@@ -164,10 +132,9 @@ namespace usb_uepcb
 			u64 diag_late = 0;
 			u64 diag_duplicate = 0;
 			u32 diag_max_ahead = 0;
-			// Claude UePcb 1.3: replaces the old "stable_deliveries" counter.
-			// Decay is now time-based (see jitter_decay_interval) so a single
-			// isolated reorder can't zero out several seconds of otherwise
-			// clean delivery and re-arm a long climb back to the max.
+
+			// Time-based decay (see jitter_decay_interval) instead of a
+			// consecutive-success counter, so one hiccup can't reset progress.
 			std::chrono::steady_clock::time_point last_target_change{};
 			bool last_target_change_valid = false;
 			std::chrono::steady_clock::time_point gap_since{};
@@ -178,15 +145,13 @@ namespace usb_uepcb
 		std::mutex jitter_lock;
 		u32 loss_log_suppress = 0;
 
-		// 1.3.3 diagnostic: forced skips on different peers in a very short
-		// window are more suggestive of a local emulator/USB scheduling stall
-		// than independent network loss. This is logging only.
+		// Forced skips on different peers within a short window suggest a
+		// local stall rather than independent network loss. Logging only.
 		std::chrono::steady_clock::time_point diag_last_forced_time{};
 		u64 diag_last_forced_peer = 0;
 		bool diag_last_forced_valid = false;
 
-		// 1.3.3 user-tunable adaptive jitter parameters. Defaults reproduce
-		// Claude 1.3/1.3.1 behavior exactly. Values are clamped on load.
+		// User-tunable jitter parameters (Settings page). Defaults match 1.3.
 		size_t jitter_max_packets = 8;
 		u32 jitter_min_target = 1;
 		u32 jitter_max_target = 4;
@@ -314,9 +279,8 @@ namespace usb_uepcb
 		return k;
 	}
 
-	// Adaptive jitter parameters are stored per UePcbState in 1.3.3 so they
-	// can be tuned from the USB settings UI without recompiling. Defaults
-	// remain Grace=3ms, Decay=4000ms, MinTarget=1, MaxTarget=4, Queue=8.
+	// Jitter parameters are per-instance so the Settings UI can tune them
+	// without recompiling. Defaults: Grace=3ms, Decay=4000ms, Min=1, Max=4, Queue=8.
 
 	static bool seq_before(u32 a, u32 b)
 	{
@@ -361,19 +325,11 @@ namespace usb_uepcb
 				jb.diag_max_ahead = ahead;
 		}
 
-		// Claude UePcb 1.3: target_packets is deliberately NOT touched here
-		// anymore. A packet simply arriving out of order (seq != jb.next_seq)
-		// is the ordinary case of two adjacent UDP datagrams swapping order
-		// by a couple of milliseconds - real Wi-Fi links do this constantly,
-		// and it self-resolves almost immediately. In 1.2 this bumped the
-		// buffer target on every such event, which measured test logs showed
-		// pinned target_packets at its max within the first ~10-40 seconds
-		// of every match and kept it there almost the whole game. Growing
-		// the buffer only happens in jitter_promote() now, at the point a
-		// gap's grace period genuinely expires - i.e. only when growing the
-		// buffer would actually have helped. gap_active/gap_since are also
-		// tracked solely in jitter_promote() now (single source of truth
-		// for that countdown), so they're not touched here either.
+		// target_packets is NOT touched here. An out-of-order arrival is
+		// usually a harmless, self-resolving 1-packet swap (common on Wi-Fi);
+		// growing the buffer only happens in jitter_promote(), when a gap's
+		// grace period genuinely expires. gap_active/gap_since are tracked
+		// solely there too, so this function doesn't touch them.
 
 		// Never allow an unbounded backlog.
 		if (jb.packets.size() >= s->jitter_max_packets)
@@ -402,11 +358,8 @@ namespace usb_uepcb
 			u32 selected_seq = 0;
 			std::chrono::steady_clock::time_point selected_arrival{};
 			bool selected = false;
-			// Claude UePcb 1.3: true only when we're giving up on a packet
-			// that's still missing after its grace period - i.e. real
-			// evidence that the current target_packets wasn't deep enough.
-			// False for the ordinary "next packet was already sitting
-			// there" case, even if it arrived slightly out of send order.
+			// True only when giving up on a packet still missing after its
+			// grace period - real evidence the buffer needs to be deeper.
 			bool selected_is_forced_skip = false;
 
 			const auto now = std::chrono::steady_clock::now();
@@ -531,10 +484,9 @@ namespace usb_uepcb
 			}
 			else
 			{
-				// Time-based decay: relax by one step once it's genuinely
-				// been calm for s->jitter_decay_interval, rather than requiring
-				// N consecutive perfect deliveries that any single hiccup
-				// would reset to zero.
+				// Time-based decay: relax by one step once calm for
+				// jitter_decay_interval, instead of needing N consecutive
+				// perfect deliveries that one hiccup would reset to zero.
 				const auto since_change =
 					std::chrono::duration_cast<std::chrono::milliseconds>(now - jb.last_target_change);
 
@@ -656,10 +608,8 @@ namespace usb_uepcb
 		if (len + kWireTrailerSize > 2048)
 			return;
 
-		// Build the wire packet once (eth frame + trailing seq number) and
-		// reuse it for every destination, instead of re-touching the
-		// sequence counter per peer - all peers should see the same seq
-		// stream from us, not a separate counter each.
+		// Build the wire packet once (frame + seq) and reuse for every
+		// destination - all peers should see the same seq stream from us.
 		u8 wire[2048];
 		std::memcpy(wire, eth, len);
 		const u32 seq = s->tx_seq.fetch_add(1, std::memory_order_relaxed);
@@ -774,10 +724,9 @@ namespace usb_uepcb
 			}
 		}
 
-		// AN986.IRX only ever drives Bulk OUT on EP2 and Bulk IN on EP1; EP3 is
-		// descriptor-compatible but unused (no sceUsbdInterruptTransfer import
-		// in the driver). Reject anything else instead of silently treating an
-		// unexpected endpoint as ethernet traffic.
+		// AN986.IRX only drives Bulk OUT on EP2 / Bulk IN on EP1 (no
+		// sceUsbdInterruptTransfer import); reject anything else instead of
+		// treating an unexpected endpoint as ethernet traffic.
 		const u8 ep = p->ep ? p->ep->nr : 0;
 
 		switch (p->pid)
@@ -820,9 +769,8 @@ namespace usb_uepcb
 			{
 				if (ep == 3)
 				{
-					// No sceUsbdInterruptTransfer import is present in
-					// AN986.IRX - NAK is closer to actual driver usage than
-					// fabricating an interrupt status packet.
+					// No interrupt transfer in the driver - NAK fits better
+					// than fabricating a status packet.
 					p->status = USB_RET_NAK;
 					break;
 				}
@@ -831,11 +779,8 @@ namespace usb_uepcb
 					p->status = USB_RET_STALL;
 					break;
 				}
-				// Promote a bounded batch only when the emulated USB controller
-				// actually polls the IN endpoint. No peer is waited for and no
-				// artificial delay is introduced.
-				// Adaptively reorder a small amount of UDP jitter only when the
-				// emulated USB IN endpoint is actually polled.
+				// Adaptively reorder a small amount of UDP jitter, only when
+				// the emulated USB IN endpoint is actually polled.
 				jitter_promote(s);
 
 				{
@@ -953,9 +898,8 @@ namespace usb_uepcb
 			Console.WriteLn("UePcb: Jitter tuning Grace=%dms Decay=%dms Min=%d Max=%d Queue=%d",
 				grace_ms, decay_ms, min_target, max_target, max_packets);
 
-			// 1.3.3 shared Peer IP history. Boolean is now confirmed for native
-			// Remember/Clear checkboxes; peer history selection remains numeric
-			// until a dynamic editable list UI is intentionally added later.
+			// Shared Peer IP history. Boolean checkboxes for Remember/Clear;
+			// peer selection is a numeric slot shown as text in the combo.
 			static constexpr int kHistorySlots = 10;
 			std::array<std::string, kHistorySlots> history{};
 			for (int i = 0; i < kHistorySlots; ++i)
@@ -1070,13 +1014,9 @@ namespace usb_uepcb
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
 
-				// Give the kernel receive buffer more headroom than the tiny
-				// OS default. Under a burst (host briefly stalls a frame,
-				// e.g. a hitch from disk I/O or GC), a small kernel buffer
-				// overflows and silently drops datagrams before
-				// udp_recv_loop() ever reads them - a loss that's invisible
-				// even to the new seq-gap logging above, since the packet
-				// never reaches userland at all.
+				// Bigger kernel receive buffer: under a burst (host stalls a
+				// frame), a small buffer overflows and silently drops
+				// datagrams before udp_recv_loop() ever reads them.
 				int rcvbuf = 256 * 1024;
 				setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 
@@ -1117,7 +1057,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - 1.4 Experimental Adaptive)"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade Direct UDP - Claude UePcb 1.4.1)"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
