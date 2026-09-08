@@ -620,7 +620,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-\t// UE PCB 1.5.1 compact TCP/UDP layout. Detailed help is shown in one
+	// UE PCB 1.5.1 compact TCP/UDP layout. Detailed help is shown in one
 	// fixed description area at the bottom when the pointer enters a setting.
 	if (m_config_prefix == "UePcb_")
 	{
