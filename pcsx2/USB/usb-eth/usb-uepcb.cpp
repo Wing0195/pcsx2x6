@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.5 (TCP / UDP Select)
+// usb-uepcb1.5.1 (TCP / UDP Select)
 // Based on: Claude UePcb 1.3
 //
 // 1.5 changes:
@@ -1254,32 +1254,10 @@ namespace usb_uepcb
 			if (tcp_history_slot >= 1 && tcp_history_slot <= kHistorySlots && !history[tcp_history_slot - 1].empty())
 				s->tcp_host_ip = history[tcp_history_slot - 1];
 
-			const std::string config_section = "USB" + std::to_string(port + 1);
-			const auto real_key = [this](const std::string& key) {
-				return std::string(TypeName()) + "_" + key;
-			};
 
-			const bool clear_history =
-				USB::GetConfigBool(si, port, TypeName(), "ClearIPHistory", false);
-			if (clear_history)
-			{
-				for (int i = 0; i < kHistorySlots; ++i)
-				{
-					history[i].clear();
-					const std::string key = "History" + std::to_string(i + 1);
-					si.SetStringValue(config_section.c_str(), real_key(key).c_str(), "");
-				}
-				for (int i = 0; i < 3; ++i)
-				{
-					const std::string key = "Peer" + std::to_string(i + 1) + "HistorySlot";
-					si.SetUIntValue(config_section.c_str(), real_key(key).c_str(), 0);
-				}
-				si.SetUIntValue(config_section.c_str(), real_key("TCPHostHistorySlot").c_str(), 0);
-				s->tcp_host_ip = USB::GetConfigString(si, port, TypeName(), "TCPHostIP", "127.0.0.1");
-				si.SetBoolValue(config_section.c_str(), real_key("ClearIPHistory").c_str(), false);
-				Console.WriteLn("UePcb: shared Peer IP history cleared");
-			}
-
+			// 1.5.1: IP history mutations are UI actions now. CreateDevice only
+			// reads settings. Writing SettingsInterface from this path can run while
+			// PCSX2 holds its settings lock and was the cause of the Save/Clear crash.
 			std::array<std::string, 3> manual_peer_ips{};
 			for (int i = 0; i < 3; ++i)
 			{
@@ -1291,44 +1269,6 @@ namespace usb_uepcb
 				const int slot = USB::GetConfigInt(si, port, TypeName(), slot_key.c_str(), 0);
 				if (slot >= 1 && slot <= kHistorySlots && !history[slot - 1].empty())
 					s->peer_ips[i] = history[slot - 1];
-			}
-
-			const bool remember_history =
-				USB::GetConfigBool(si, port, TypeName(), "RememberCurrentIPs", false);
-			if (remember_history && !clear_history)
-			{
-				std::array<std::string, kHistorySlots> updated{};
-				int used = 0;
-
-				const auto add_unique = [&](const std::string& ip) {
-					if (ip.empty() || used >= kHistorySlots)
-						return;
-					for (int j = 0; j < used; ++j)
-					{
-						if (updated[j] == ip)
-							return;
-					}
-					updated[used++] = ip;
-				};
-
-				// Current resolved addresses become MRU entries. UDP stores Peer1-3;
-				// TCP Client stores the Host IP in the same shared history pool.
-				if (s->connection_mode == 1 && !s->tcp_is_host)
-					add_unique(s->tcp_host_ip);
-				else
-					for (const std::string& ip : s->peer_ips)
-						add_unique(ip);
-				for (const std::string& ip : history)
-					add_unique(ip);
-
-				history = updated;
-				for (int i = 0; i < kHistorySlots; ++i)
-				{
-					const std::string key = "History" + std::to_string(i + 1);
-					si.SetStringValue(config_section.c_str(), real_key(key).c_str(), history[i].c_str());
-				}
-				si.SetBoolValue(config_section.c_str(), real_key("RememberCurrentIPs").c_str(), false);
-				Console.WriteLn("UePcb: remembered current Peer IPs into shared history");
 			}
 
 			for (int i = 0; i < 3; ++i)
@@ -1424,7 +1364,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.5"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.5.1"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
