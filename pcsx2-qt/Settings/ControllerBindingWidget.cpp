@@ -620,7 +620,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-	// UE PCB 1.5.1 compact TCP/UDP layout. Detailed help is shown in one
+	// UE PCB 1.6B compact TCP/UDP layout. Detailed help is shown in one
 	// fixed description area at the bottom when the pointer enters a setting.
 	if (m_config_prefix == "UePcb_")
 	{
@@ -683,13 +683,13 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		auto hostPair = addString("TCPHostIP", tr("TCP Host IP"), "127.0.0.1", current_row, 0);
 		auto tcpHist = addHistoryCombo("TCPHostHistorySlot", tr("Saved IP"), current_row, 2); current_row++;
 
-		QCheckBox* remember = new QCheckBox(tr("Remember Current IPs"), widget_parent);
+		// Save/Clear are one-shot actions, so push buttons are clearer than
+		// checkboxes (there is no persistent on/off state to display).
+		QPushButton* remember = new QPushButton(tr("Save Current IPs"), widget_parent);
 		remember->setObjectName(QStringLiteral("RememberCurrentIPs"));
-		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(sif, remember, m_config_section, m_config_prefix + "RememberCurrentIPs", false);
 		layout->addWidget(remember, current_row, 0, 1, 2);
-		QCheckBox* clear = new QCheckBox(tr("Clear Shared IP History"), widget_parent);
+		QPushButton* clear = new QPushButton(tr("Clear Saved IPs"), widget_parent);
 		clear->setObjectName(QStringLiteral("ClearIPHistory"));
-		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(sif, clear, m_config_section, m_config_prefix + "ClearIPHistory", false);
 		layout->addWidget(clear, current_row, 2, 1, 2); current_row++;
 
 		QCheckBox* advanced = new QCheckBox(tr("Advanced Settings"), widget_parent);
@@ -702,6 +702,30 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		auto maxTarget = addInt("JitterMaxTarget", tr("Maximum Target Buffer"), 4, 1, 8, 1, current_row, 2); current_row++;
 		auto maxQueue = addInt("JitterMaxPackets", tr("Maximum Jitter Queue"), 8, 1, 32, 1, current_row, 0);
 		auto broadcast = addString("TargetIP", tr("Broadcast Address"), "255.255.255.255", current_row, 2); current_row++;
+
+		// 1.6B Sync Priority beta switches. Each option is independent so the
+		// user can run clean A/B tests against the 1.5.1 baseline.
+		QCheckBox* betaSyncHold = new QCheckBox(tr("Beta: Sync Hold"), widget_parent);
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, betaSyncHold, m_config_section, m_config_prefix + "BetaSyncHold", false);
+		layout->addWidget(betaSyncHold, current_row, 0, 1, 2);
+		auto betaHoldMs = addInt("BetaSyncHoldMs", tr("Sync Hold (ms)"), 30, 3, 100, 1, current_row, 2); current_row++;
+
+		QCheckBox* betaRetransmit = new QCheckBox(tr("Beta: UDP Retransmit"), widget_parent);
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, betaRetransmit, m_config_section, m_config_prefix + "BetaUdpRetransmit", false);
+		layout->addWidget(betaRetransmit, current_row, 0, 1, 2);
+		QCheckBox* betaPlayout = new QCheckBox(tr("Beta: Adaptive Playout"), widget_parent);
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, betaPlayout, m_config_section, m_config_prefix + "BetaAdaptivePlayout", false);
+		layout->addWidget(betaPlayout, current_row, 2, 1, 2); current_row++;
+
+		QCheckBox* betaStallGuard = new QCheckBox(tr("Beta: Global Stall Guard"), widget_parent);
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, betaStallGuard, m_config_section, m_config_prefix + "BetaGlobalStallGuard", false);
+		layout->addWidget(betaStallGuard, current_row, 0, 1, 2);
+		auto betaPlayoutMax = addInt("BetaPlayoutMaxMs", tr("Playout Max (ms)"), 6, 0, 20, 1, current_row, 2); current_row++;
+
 		auto mac = addString("MacHex", tr("MAC 12-hex"), "", current_row, 0); current_row++;
 
 		// Fixed-height help area: detailed text moves here instead of consuming rows.
@@ -727,9 +751,9 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		helpPair(bindPair, tr("TCP Host Listen IP: 0.0.0.0 accepts connections on all LAN/VPN adapters. Use 127.0.0.1 only when every instance is on the same PC. This field is ignored in TCP Client mode."));
 		helpPair(hostPair, tr("TCP Client Host IP: use 127.0.0.1 for same-PC play. Across LAN or VPN, enter the Host machine's LAN/Tailscale/VPN address. You may also select the Host from the shared Saved IP history."));
 		helpPair(tcpHist, tr("Choose Manual to use TCP Host IP, or select one of the shared Saved IP 1-10 entries."));
-		const QString rememberHelp = tr("Remember Current IPs saves the currently resolved addresses into the shared 10-entry history immediately. UDP saves Peer 1-3; TCP Client saves the Host IP. Recent addresses move to the front and duplicates are removed. The checkbox resets automatically.");
+		const QString rememberHelp = tr("Save Current IPs stores the currently resolved addresses into the shared 10-entry history immediately. UDP saves Peer 1-3; TCP Client saves the Host IP. Recent addresses move to the front and duplicates are removed.");
 		help(remember, rememberHelp);
-		help(clear, tr("Clear Shared IP History immediately erases all ten saved addresses and returns all UDP/TCP Saved IP selectors to Manual. The checkbox resets automatically."));
+		help(clear, tr("Clear Saved IPs immediately erases all ten saved addresses and returns all UDP/TCP Saved IP selectors to Manual."));
 		help(advanced, tr("Leave Advanced Settings unchecked for the proven UDP defaults: Jitter Grace 3 ms, Buffer Decay 4000 ms, Minimum Target 1, Maximum Target 4 and Queue 8. Enable it to unlock manual UDP jitter tuning and Broadcast Address. TCP bypasses these controls."));
 		helpPair(grace, tr("Jitter Grace is how long a missing UDP sequence may recover before a forced skip. Default: 3 ms."));
 		helpPair(decay, tr("Buffer Decay is the stable playback time before the adaptive target buffer drops by one step. Default: 4000 ms; 8000-12000 ms can be useful smoothness tests."));
@@ -737,9 +761,15 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		helpPair(maxTarget, tr("Maximum Target Buffer limits how far the adaptive UDP playback depth can grow. Default: 4."));
 		helpPair(maxQueue, tr("Maximum Jitter Queue is the hard per-peer UDP holding limit. Default: 8. Increasing it too far can accumulate latency."));
 		helpPair(broadcast, tr("Broadcast Address is used only in UDP when all three Direct Peer IPs are empty. Default: 255.255.255.255. It is useful for same-PC multi-instance and simple LAN broadcast testing."));
+		help(betaSyncHold, tr("Beta Sync Hold changes missing-packet handling from speed-first to synchronization-first. Instead of forced-skipping as soon as the normal jitter rule expires, UEPCB may hold the stream for the configured bounded time. This can create intentional slowdown during network instability while giving late packets time to recover."));
+		helpPair(betaHoldMs, tr("Sync Hold is the maximum bounded wait for a missing UDP sequence when Beta Sync Hold is enabled. Default: 30 ms. Higher values protect synchronization more aggressively but can create longer slowdown during genuine loss."));
+		help(betaRetransmit, tr("Beta UDP Retransmit sends emulator-only NACK requests for a missing sequence and keeps a short cache of recently transmitted packets. It is most meaningful together with Sync Hold, because the retransmitted packet needs time to return before a forced skip."));
+		help(betaPlayout, tr("Beta Adaptive Playout adds a small common time-based delivery delay after real forced skips have raised the adaptive target buffer. Stable play adds no extra delay; stressed play can become slightly slower and more even. Disable it to use the 1.5.1 packet-count behavior."));
+		helpPair(betaPlayoutMax, tr("Playout Max limits the extra time-based delay used by Beta Adaptive Playout. Default: 6 ms. It is not ping compensation; it only caps the short smoothing delay applied after genuine network stress."));
+		help(betaStallGuard, tr("Beta Global Stall Guard watches for different peers forced-skipping within 100 ms. That pattern often resembles a local PCSX2/USB scheduling hitch rather than independent network loss, so the guard prevents several peer buffers from remaining enlarged after the local stall."));
 		helpPair(mac, tr("Leave MAC 12-hex blank so each emulator instance automatically generates a unique Namco MAC. Only enter 12 hexadecimal digits when a fixed MAC is specifically required."));
 
-		// 1.5.1 Save/Clear are real UI actions. No SettingsInterface writes occur in CreateDevice.
+		// 1.6B Save/Clear are one-shot push-button UI actions. CreateDevice stays read-only.
 		const auto refreshHistoryCombos = [=]() {
 			for (QComboBox* cb : {peer1hist.second, peer2hist.second, peer3hist.second, tcpHist.second})
 			{
@@ -753,8 +783,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 				cb->setCurrentIndex(old);
 			}
 		};
-		connect(remember, &QCheckBox::toggled, this, [=](bool checked) {
-			if (!checked) return;
+		connect(remember, &QPushButton::clicked, this, [=]() {
 			QStringList candidates;
 			const auto resolved = [&](QLineEdit* manual, QComboBox* combo) {
 				if (combo->currentIndex() >= 1)
@@ -775,31 +804,68 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 				candidates << QString::fromStdString(m_dialog->getStringValue(m_config_section.c_str(), key.c_str(), ""));
 			}
 			QStringList unique;
-			for (const QString& ip : candidates) if (!ip.trimmed().isEmpty() && !unique.contains(ip.trimmed())) unique << ip.trimmed();
+			for (const QString& ip : candidates)
+				if (!ip.trimmed().isEmpty() && !unique.contains(ip.trimmed()))
+					unique << ip.trimmed();
 			for (int i = 1; i <= 10; i++)
-				m_dialog->setStringValue(m_config_section.c_str(), (m_config_prefix + fmt::format("History{}", i)).c_str(), (i <= unique.size()) ? unique[i - 1].toStdString().c_str() : "");
+			{
+				const std::string value = (i <= unique.size()) ? unique[i - 1].toStdString() : std::string();
+				m_dialog->setStringValue(
+					m_config_section.c_str(),
+					(m_config_prefix + fmt::format("History{}", i)).c_str(),
+					value.c_str());
+			}
 			refreshHistoryCombos();
-			remember->setChecked(false);
 		});
-		connect(clear, &QCheckBox::toggled, this, [=](bool checked) {
-			if (!checked) return;
-			for (int i = 1; i <= 10; i++) m_dialog->setStringValue(m_config_section.c_str(), (m_config_prefix + fmt::format("History{}", i)).c_str(), "");
-			for (const char* key : {"Peer1HistorySlot", "Peer2HistorySlot", "Peer3HistorySlot", "TCPHostHistorySlot"}) m_dialog->setIntValue(m_config_section.c_str(), (m_config_prefix + key).c_str(), 0);
-			peer1hist.second->setCurrentIndex(0); peer2hist.second->setCurrentIndex(0); peer3hist.second->setCurrentIndex(0); tcpHist.second->setCurrentIndex(0);
+		connect(clear, &QPushButton::clicked, this, [=]() {
+			for (int i = 1; i <= 10; i++)
+				m_dialog->setStringValue(m_config_section.c_str(), (m_config_prefix + fmt::format("History{}", i)).c_str(), "");
+			for (const char* key : {"Peer1HistorySlot", "Peer2HistorySlot", "Peer3HistorySlot", "TCPHostHistorySlot"})
+				m_dialog->setIntValue(m_config_section.c_str(), (m_config_prefix + key).c_str(), 0);
+			peer1hist.second->setCurrentIndex(0);
+			peer2hist.second->setCurrentIndex(0);
+			peer3hist.second->setCurrentIndex(0);
+			tcpHist.second->setCurrentIndex(0);
 			refreshHistoryCombos();
-			clear->setChecked(false);
 		});
 
 		const auto setPairEnabled = [](auto pair, bool enabled) { pair.first->setEnabled(enabled); pair.second->setEnabled(enabled); };
 		const auto updateEnabled = [=]() {
-			const bool isTcp = (mode->currentIndex() == 1), isHost = (role->currentIndex() == 0), adv = advanced->isChecked();
-			setPairEnabled(peer1, !isTcp); setPairEnabled(peer1hist, !isTcp); setPairEnabled(peer2, !isTcp); setPairEnabled(peer2hist, !isTcp); setPairEnabled(peer3, !isTcp); setPairEnabled(peer3hist, !isTcp);
-			roleLabel->setEnabled(isTcp); role->setEnabled(isTcp); setPairEnabled(bindPair, isTcp && isHost); setPairEnabled(hostPair, isTcp && !isHost); setPairEnabled(tcpHist, isTcp && !isHost);
-			const bool jitterEnabled = !isTcp && adv; setPairEnabled(grace, jitterEnabled); setPairEnabled(decay, jitterEnabled); setPairEnabled(minTarget, jitterEnabled); setPairEnabled(maxTarget, jitterEnabled); setPairEnabled(maxQueue, jitterEnabled); setPairEnabled(broadcast, jitterEnabled); advanced->setEnabled(!isTcp);
+			const bool isTcp = (mode->currentIndex() == 1);
+			const bool isHost = (role->currentIndex() == 0);
+			const bool adv = advanced->isChecked();
+
+			setPairEnabled(peer1, !isTcp); setPairEnabled(peer1hist, !isTcp);
+			setPairEnabled(peer2, !isTcp); setPairEnabled(peer2hist, !isTcp);
+			setPairEnabled(peer3, !isTcp); setPairEnabled(peer3hist, !isTcp);
+			roleLabel->setEnabled(isTcp); role->setEnabled(isTcp);
+			setPairEnabled(bindPair, isTcp && isHost);
+			setPairEnabled(hostPair, isTcp && !isHost);
+			setPairEnabled(tcpHist, isTcp && !isHost);
+
+			const bool jitterEnabled = !isTcp && adv;
+			setPairEnabled(grace, jitterEnabled);
+			setPairEnabled(decay, jitterEnabled);
+			setPairEnabled(minTarget, jitterEnabled);
+			setPairEnabled(maxTarget, jitterEnabled);
+			setPairEnabled(maxQueue, jitterEnabled);
+			setPairEnabled(broadcast, jitterEnabled);
+			advanced->setEnabled(!isTcp);
+
+			// Beta features are UDP-only. Their switches remain independent,
+			// while numeric fields only unlock when the matching switch is on.
+			betaSyncHold->setEnabled(!isTcp);
+			betaRetransmit->setEnabled(!isTcp);
+			betaPlayout->setEnabled(!isTcp);
+			betaStallGuard->setEnabled(!isTcp);
+			setPairEnabled(betaHoldMs, !isTcp && betaSyncHold->isChecked());
+			setPairEnabled(betaPlayoutMax, !isTcp && betaPlayout->isChecked());
 		};
 		connect(mode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int) { updateEnabled(); });
 		connect(role, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int) { updateEnabled(); });
 		connect(advanced, &QCheckBox::toggled, this, [=](bool) { updateEnabled(); });
+		connect(betaSyncHold, &QCheckBox::toggled, this, [=](bool) { updateEnabled(); });
+		connect(betaPlayout, &QCheckBox::toggled, this, [=](bool) { updateEnabled(); });
 		updateEnabled();
 
 		QHBoxLayout* bottom_hlayout = new QHBoxLayout();

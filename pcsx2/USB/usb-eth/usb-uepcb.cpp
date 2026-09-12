@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.5.1 (TCP / UDP Select)
+// usb-uepcb1.6B (Beta Sync Priority)
 // Based on: Claude UePcb 1.3
 //
 // 1.5 changes:
@@ -101,7 +101,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.5 (TCP/UDP)", ""};
+		"", "Namco", "UE PCB v1.6B (TCP/UDP Beta)", ""};
 
 	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
 	// frame. This is purely an emulator-side addition (real UE PCB hardware
@@ -109,6 +109,13 @@ namespace usb_uepcb
 	// safe to change the wire format freely. It lets us detect drops /
 	// reordering per-peer without touching the AN986 driver protocol at all.
 	static constexpr int kWireTrailerSize = sizeof(u32);
+
+	// 1.6B emulator-only UDP recovery control packet.
+	// Layout (16 bytes): "UEPN", type, target MAC[6], missing seq (BE), reserved.
+	// Older UEPCB builds ignore it because it is shorter than an Ethernet frame
+	// plus the normal sequence trailer.
+	static constexpr int kUdpControlSize = 16;
+	static constexpr u8 kUdpControlTypeNack = 1;
 
 	typedef struct UePcbState
 	{
@@ -180,6 +187,16 @@ namespace usb_uepcb
 			bool last_target_change_valid = false;
 			std::chrono::steady_clock::time_point gap_since{};
 			bool gap_active = false;
+
+			// 1.6B beta diagnostics/recovery state. These fields only affect
+			// behavior when the matching beta option is enabled.
+			std::chrono::steady_clock::time_point gap_last_nack{};
+			bool gap_nack_time_valid = false;
+			u32 gap_nack_count = 0;
+			bool gap_hold_counted = false;
+			u64 diag_hold_events = 0;
+			u64 diag_nack_sent = 0;
+			u64 diag_max_gap_ms = 0;
 	};
 
 		std::unordered_map<u64, PeerJitter> peer_jitter;
@@ -193,13 +210,22 @@ namespace usb_uepcb
 		u64 diag_last_forced_peer = 0;
 		bool diag_last_forced_valid = false;
 
-		// 1.3.3 user-tunable adaptive jitter parameters. Defaults reproduce
-		// Claude 1.3/1.3.1 behavior exactly. Values are clamped on load.
+		// User-tunable adaptive jitter parameters. Defaults reproduce
+		// the stable 1.5.1 behavior exactly. Values are clamped on load.
 		size_t jitter_max_packets = 8;
 		u32 jitter_min_target = 1;
 		u32 jitter_max_target = 4;
 		std::chrono::milliseconds jitter_grace{3};
 		std::chrono::milliseconds jitter_decay_interval{4000};
+
+		// 1.6B Sync Priority beta features. Every feature is independently
+		// switchable so A/B testing can identify what actually helps.
+		bool beta_sync_hold = false;
+		std::chrono::milliseconds beta_sync_hold_time{30};
+		bool beta_udp_retransmit = false;
+		bool beta_adaptive_playout = false;
+		std::chrono::milliseconds beta_playout_max{6};
+		bool beta_global_stall_guard = false;
 
 		// Transport selection: 0 = UDP, 1 = TCP.
 		int connection_mode = 0;
@@ -207,6 +233,16 @@ namespace usb_uepcb
 
 		// UDP transport.
 		socket_t udp_sock = UEPCB_INVALID_SOCKET;
+
+		struct UdpCachedPacket
+		{
+			u32 seq = 0;
+			std::vector<u8> wire;
+		};
+		std::deque<UdpCachedPacket> udp_tx_cache;
+		std::mutex udp_tx_cache_lock;
+		u64 diag_nack_rx = 0;
+		u64 diag_retransmit_tx = 0;
 
 		// TCP transport. Host is an N-way hub; Client keeps one connection to Host.
 		bool tcp_is_host = true;
@@ -415,6 +451,30 @@ namespace usb_uepcb
 			seq, std::move(data), now, diag_was_ahead});
 	}
 
+	static void udp_send_nack(UePcbState* s, u64 target_peer_key, u32 missing_seq);
+	static u32 read_be_u32(const u8* p);
+	static bool udp_resend_cached(UePcbState* s, u32 seq);
+
+	static std::chrono::milliseconds beta_playout_delay_locked(const UePcbState* s)
+	{
+		if (!s->beta_adaptive_playout)
+			return std::chrono::milliseconds(0);
+
+		u32 highest_target = s->jitter_min_target;
+		for (const auto& entry : s->peer_jitter)
+		{
+			if (entry.second.target_packets > highest_target)
+				highest_target = entry.second.target_packets;
+		}
+
+		const u32 steps = (highest_target > s->jitter_min_target) ?
+			(highest_target - s->jitter_min_target) : 0;
+		long long delay_ms = static_cast<long long>(steps) * 2;
+		if (delay_ms > s->beta_playout_max.count())
+			delay_ms = s->beta_playout_max.count();
+		return std::chrono::milliseconds(delay_ms);
+	}
+
 	static void jitter_promote(UePcbState* s)
 	{
 		std::lock_guard<std::mutex> jitter_lock(s->jitter_lock);
@@ -426,14 +486,10 @@ namespace usb_uepcb
 			u32 selected_seq = 0;
 			std::chrono::steady_clock::time_point selected_arrival{};
 			bool selected = false;
-			// Claude UePcb 1.3: true only when we're giving up on a packet
-			// that's still missing after its grace period - i.e. real
-			// evidence that the current target_packets wasn't deep enough.
-			// False for the ordinary "next packet was already sitting
-			// there" case, even if it arrived slightly out of send order.
 			bool selected_is_forced_skip = false;
 
 			const auto now = std::chrono::steady_clock::now();
+			const auto beta_playout_delay = beta_playout_delay_locked(s);
 
 			for (auto& entry : s->peer_jitter)
 			{
@@ -449,7 +505,15 @@ namespace usb_uepcb
 						std::chrono::duration_cast<std::chrono::milliseconds>(
 							now - expected->second.arrival);
 
-					if (jb.packets.size() >= jb.target_packets || age >= s->jitter_grace)
+					// Legacy 1.5.1 readiness is preserved. The beta time-based
+					// playout option only adds a small common minimum age after
+					// a real forced skip has raised a peer's target buffer.
+					const bool legacy_ready =
+						(jb.packets.size() >= jb.target_packets || age >= s->jitter_grace);
+					const bool playout_ready =
+						(!s->beta_adaptive_playout || age >= beta_playout_delay);
+
+					if (legacy_ready && playout_ready)
 					{
 						if (!selected || expected->second.arrival < selected_arrival)
 						{
@@ -463,24 +527,71 @@ namespace usb_uepcb
 				}
 				else
 				{
-					// A sequence gap exists. Give the missing packet a very
-					// short grace period so normal UDP reordering can recover.
+					// A sequence gap exists. 1.5.1 would skip when the packet
+					// target filled or the short grace expired. Sync Hold beta
+					// deliberately prefers synchronization: it ignores queue
+					// depth and waits a bounded amount of real time instead.
 					if (!jb.gap_active)
 					{
 						jb.gap_active = true;
 						jb.gap_since = now;
+						jb.gap_nack_time_valid = false;
+						jb.gap_nack_count = 0;
+						jb.gap_hold_counted = false;
 					}
 
 					const auto gap_age =
 						std::chrono::duration_cast<std::chrono::milliseconds>(
 							now - jb.gap_since);
+					if (static_cast<u64>(gap_age.count()) > jb.diag_max_gap_ms)
+						jb.diag_max_gap_ms = static_cast<u64>(gap_age.count());
 
-					if (jb.packets.size() >= jb.target_packets || gap_age >= s->jitter_grace)
+					std::chrono::milliseconds hold_limit = s->beta_sync_hold_time;
+					if (hold_limit < s->jitter_grace)
+						hold_limit = s->jitter_grace;
+
+					if (s->beta_sync_hold && gap_age >= s->jitter_grace &&
+						gap_age < hold_limit && !jb.gap_hold_counted)
 					{
-						// The missing packet is considered too late. Advance to
-						// the earliest packet already buffered; never block PCSX2.
-						auto first = jb.packets.begin();
+						++jb.diag_hold_events;
+						jb.gap_hold_counted = true;
+					}
 
+					// Selective retransmission beta: after ordinary reorder grace
+					// has expired, request the exact missing sequence. Up to three
+					// NACKs are sent 8 ms apart while Sync Hold keeps the stream
+					// from advancing. This is emulator-side control traffic only.
+					if (s->beta_udp_retransmit && gap_age >= s->jitter_grace &&
+						jb.gap_nack_count < 3)
+					{
+						bool nack_due = !jb.gap_nack_time_valid;
+						if (!nack_due)
+						{
+							const auto since_nack =
+								std::chrono::duration_cast<std::chrono::milliseconds>(
+									now - jb.gap_last_nack);
+							nack_due = (since_nack.count() >= 8);
+						}
+						if (nack_due)
+						{
+							udp_send_nack(s, entry.first, jb.next_seq);
+							jb.gap_last_nack = now;
+							jb.gap_nack_time_valid = true;
+							++jb.gap_nack_count;
+							++jb.diag_nack_sent;
+						}
+					}
+
+					bool gap_ready = false;
+					if (s->beta_sync_hold)
+						gap_ready = (gap_age >= hold_limit);
+					else
+						gap_ready =
+							(jb.packets.size() >= jb.target_packets || gap_age >= s->jitter_grace);
+
+					if (gap_ready)
+					{
+						auto first = jb.packets.begin();
 						if (!selected || first->second.arrival < selected_arrival)
 						{
 							selected = true;
@@ -505,8 +616,6 @@ namespace usb_uepcb
 			if (packet_it == jb.packets.end())
 				break;
 
-			// Diagnostic only: if a packet first arrived ahead but is now promoted
-			// exactly at the expected playback point, that reorder was recovered.
 			if (!selected_is_forced_skip && packet_it->second.diag_was_ahead)
 				++jb.diag_recovered;
 
@@ -514,6 +623,9 @@ namespace usb_uepcb
 			jb.packets.erase(packet_it);
 			jb.next_seq = selected_seq + 1;
 			jb.gap_active = false;
+			jb.gap_nack_time_valid = false;
+			jb.gap_nack_count = 0;
+			jb.gap_hold_counted = false;
 
 			if (!jb.last_target_change_valid)
 			{
@@ -525,44 +637,56 @@ namespace usb_uepcb
 			{
 				++jb.diag_forced_skip;
 
-				// Diagnostic only: multiple different peers forced-skipping within
-				// 100ms strongly resembles the same-PC 1P stall seen in test logs.
-				if (s->diag_last_forced_valid && s->diag_last_forced_peer != selected_peer)
+				bool possible_local_stall = false;
+				const u64 previous_forced_peer = s->diag_last_forced_peer;
+				if (s->diag_last_forced_valid && previous_forced_peer != selected_peer)
 				{
 					const auto burst_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 						now - s->diag_last_forced_time);
 					if (burst_ms.count() >= 0 && burst_ms.count() <= 100)
 					{
+						possible_local_stall = true;
 						Console.WriteLn(
 							"UePcb DIAG: possible local stall - forced skips on different peers within %lldms",
 							static_cast<long long>(burst_ms.count()));
 					}
 				}
-				s->diag_last_forced_time = now;
-				s->diag_last_forced_peer = selected_peer;
-				s->diag_last_forced_valid = true;
 
-				// Real, unresolved gap - this is the only place target_packets
-				// grows now. One step at a time, same as 1.2.
-				if (jb.target_packets < s->jitter_max_target)
+				// Global Stall Guard beta prevents a same-process scheduling hitch
+				// from leaving several peer buffers artificially enlarged for
+				// seconds. If the second peer confirms a <100ms multi-peer stall,
+				// undo one step on the previous peer and don't grow this peer.
+				if (possible_local_stall && s->beta_global_stall_guard)
+				{
+					auto previous_it = s->peer_jitter.find(previous_forced_peer);
+					if (previous_it != s->peer_jitter.end() &&
+						previous_it->second.target_packets > s->jitter_min_target)
+					{
+						--previous_it->second.target_packets;
+						previous_it->second.last_target_change = now;
+					}
+					Console.WriteLn("UePcb BETA: Global Stall Guard suppressed multi-peer buffer growth");
+				}
+				else if (jb.target_packets < s->jitter_max_target)
 				{
 					++jb.target_packets;
 					Console.WriteLn(
 						"UePcb: target buffer -> %u (peer key %llu) - forced skip of a missing packet",
 						jb.target_packets, static_cast<unsigned long long>(selected_peer));
 				}
+
+				s->diag_last_forced_time = now;
+				s->diag_last_forced_peer = selected_peer;
+				s->diag_last_forced_valid = true;
 				jb.last_target_change = now;
 			}
 			else
 			{
-				// Time-based decay: relax by one step once it's genuinely
-				// been calm for s->jitter_decay_interval, rather than requiring
-				// N consecutive perfect deliveries that any single hiccup
-				// would reset to zero.
 				const auto since_change =
 					std::chrono::duration_cast<std::chrono::milliseconds>(now - jb.last_target_change);
 
-				if (jb.target_packets > s->jitter_min_target && since_change >= s->jitter_decay_interval)
+				if (jb.target_packets > s->jitter_min_target &&
+					since_change >= s->jitter_decay_interval)
 				{
 					--jb.target_packets;
 					jb.last_target_change = now;
@@ -574,7 +698,6 @@ namespace usb_uepcb
 			}
 		}
 	}
-
 
 	static bool tcp_recv_exact(socket_t c, u8* buf, int len)
 	{
@@ -830,6 +953,21 @@ namespace usb_uepcb
 			if (s->thread_stop)
 				break;
 
+			// 1.6B emulator-only selective retransmission request.
+			if (n == kUdpControlSize &&
+				buf[0] == 'U' && buf[1] == 'E' && buf[2] == 'P' && buf[3] == 'N' &&
+				buf[4] == kUdpControlTypeNack)
+			{
+				if (std::memcmp(buf + 5, s->mac, 6) == 0)
+				{
+					++s->diag_nack_rx;
+					const u32 requested_seq = read_be_u32(buf + 11);
+					if (udp_resend_cached(s, requested_seq))
+						Console.WriteLn("UePcb BETA: retransmitted UDP seq %u", requested_seq);
+				}
+				continue;
+			}
+
 			if (n < static_cast<int>(14 + kWireTrailerSize))
 				continue;
 
@@ -908,6 +1046,93 @@ namespace usb_uepcb
 			reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
 	}
 
+	static void udp_send_wire_to_destinations(UePcbState* s, const u8* wire, int wire_len)
+	{
+		if (has_direct_peers(s))
+		{
+			for (const std::string& ip : s->peer_ips)
+				udp_send_to(s, ip, wire, wire_len);
+			return;
+		}
+		udp_send_to(s, s->broadcast_ip, wire, wire_len);
+	}
+
+	static void peer_key_to_mac(u64 key, u8* mac)
+	{
+		for (int i = 5; i >= 0; --i)
+		{
+			mac[i] = static_cast<u8>(key & 0xff);
+			key >>= 8;
+		}
+	}
+
+	static u32 read_be_u32(const u8* p)
+	{
+		return (static_cast<u32>(p[0]) << 24) |
+			(static_cast<u32>(p[1]) << 16) |
+			(static_cast<u32>(p[2]) << 8) |
+			static_cast<u32>(p[3]);
+	}
+
+	static void write_be_u32(u8* p, u32 v)
+	{
+		p[0] = static_cast<u8>((v >> 24) & 0xff);
+		p[1] = static_cast<u8>((v >> 16) & 0xff);
+		p[2] = static_cast<u8>((v >> 8) & 0xff);
+		p[3] = static_cast<u8>(v & 0xff);
+	}
+
+	static void udp_send_nack(UePcbState* s, u64 target_peer_key, u32 missing_seq)
+	{
+		if (!s->beta_udp_retransmit || s->udp_sock == UEPCB_INVALID_SOCKET)
+			return;
+
+		u8 control[kUdpControlSize] = {};
+		control[0] = 'U'; control[1] = 'E'; control[2] = 'P'; control[3] = 'N';
+		control[4] = kUdpControlTypeNack;
+		peer_key_to_mac(target_peer_key, control + 5);
+		write_be_u32(control + 11, missing_seq);
+
+		// Send control traffic to configured peers. Also send the broadcast
+		// address once: this makes same-PC/broadcast testing more likely to
+		// reach the intended instance; the embedded target MAC makes it safe
+		// for unrelated UEPCB instances to ignore the request.
+		if (has_direct_peers(s))
+		{
+			for (const std::string& ip : s->peer_ips)
+				udp_send_to(s, ip, control, kUdpControlSize);
+			if (!s->broadcast_ip.empty())
+				udp_send_to(s, s->broadcast_ip, control, kUdpControlSize);
+		}
+		else
+		{
+			udp_send_to(s, s->broadcast_ip, control, kUdpControlSize);
+		}
+	}
+
+	static bool udp_resend_cached(UePcbState* s, u32 seq)
+	{
+		std::vector<u8> wire;
+		{
+			std::lock_guard<std::mutex> lk(s->udp_tx_cache_lock);
+			for (const auto& cached : s->udp_tx_cache)
+			{
+				if (cached.seq == seq)
+				{
+					wire = cached.wire;
+					break;
+				}
+			}
+		}
+
+		if (wire.empty())
+			return false;
+
+		udp_send_wire_to_destinations(s, wire.data(), static_cast<int>(wire.size()));
+		++s->diag_retransmit_tx;
+		return true;
+	}
+
 	static void udp_send_packet(UePcbState* s, const u8* eth, int len)
 	{
 		if (s->udp_sock == UEPCB_INVALID_SOCKET)
@@ -915,24 +1140,24 @@ namespace usb_uepcb
 		if (len + kWireTrailerSize > 2048)
 			return;
 
-		// Build the wire packet once (eth frame + trailing seq number) and
-		// reuse it for every destination, instead of re-touching the
-		// sequence counter per peer - all peers should see the same seq
-		// stream from us, not a separate counter each.
 		u8 wire[2048];
 		std::memcpy(wire, eth, len);
 		const u32 seq = s->tx_seq.fetch_add(1, std::memory_order_relaxed);
 		std::memcpy(wire + len, &seq, sizeof(seq));
 		const int wire_len = len + kWireTrailerSize;
 
-		if (has_direct_peers(s))
+		if (s->beta_udp_retransmit)
 		{
-			for (const std::string& ip : s->peer_ips)
-				udp_send_to(s, ip, wire, wire_len);
-			return;
+			std::lock_guard<std::mutex> lk(s->udp_tx_cache_lock);
+			UePcbState::UdpCachedPacket cached;
+			cached.seq = seq;
+			cached.wire.assign(wire, wire + wire_len);
+			s->udp_tx_cache.push_back(std::move(cached));
+			while (s->udp_tx_cache.size() > 64)
+				s->udp_tx_cache.pop_front();
 		}
 
-		udp_send_to(s, s->broadcast_ip, wire, wire_len);
+		udp_send_wire_to_destinations(s, wire, wire_len);
 	}
 
 	static void uepcb_handle_reset(USBDevice* dev)
@@ -1195,7 +1420,7 @@ namespace usb_uepcb
 			{
 				const auto& jb = entry.second;
 				Console.WriteLn(
-					"UePcb DIAG summary peer=%llu RX=%llu Ahead=%llu Recovered=%llu ForcedSkip=%llu Late=%llu Duplicate=%llu MaxAhead=%u FinalBuffer=%u Queue=%zu",
+					"UePcb DIAG summary peer=%llu RX=%llu Ahead=%llu Recovered=%llu ForcedSkip=%llu Late=%llu Duplicate=%llu MaxAhead=%u Hold=%llu NackSent=%llu MaxGapMs=%llu FinalBuffer=%u Queue=%zu",
 					static_cast<unsigned long long>(entry.first),
 					static_cast<unsigned long long>(jb.diag_rx),
 					static_cast<unsigned long long>(jb.diag_ahead),
@@ -1203,8 +1428,15 @@ namespace usb_uepcb
 					static_cast<unsigned long long>(jb.diag_forced_skip),
 					static_cast<unsigned long long>(jb.diag_late),
 					static_cast<unsigned long long>(jb.diag_duplicate),
-					jb.diag_max_ahead, jb.target_packets, jb.packets.size());
+					jb.diag_max_ahead,
+					static_cast<unsigned long long>(jb.diag_hold_events),
+					static_cast<unsigned long long>(jb.diag_nack_sent),
+					static_cast<unsigned long long>(jb.diag_max_gap_ms),
+					jb.target_packets, jb.packets.size());
 			}
+			Console.WriteLn("UePcb BETA summary NackRX=%llu RetransmitTX=%llu",
+				static_cast<unsigned long long>(s->diag_nack_rx),
+				static_cast<unsigned long long>(s->diag_retransmit_tx));
 		}
 		delete s;
 	}
@@ -1239,6 +1471,22 @@ namespace usb_uepcb
 			s->jitter_max_packets = static_cast<size_t>(max_packets);
 			Console.WriteLn("UePcb: Jitter tuning Grace=%dms Decay=%dms Min=%d Max=%d Queue=%d",
 				grace_ms, decay_ms, min_target, max_target, max_packets);
+
+			// 1.6B beta options are deliberately independent for clean A/B tests.
+			s->beta_sync_hold = USB::GetConfigBool(si, port, TypeName(), "BetaSyncHold", false);
+			const int sync_hold_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "BetaSyncHoldMs", 30), 3, 100);
+			s->beta_sync_hold_time = std::chrono::milliseconds(sync_hold_ms);
+			s->beta_udp_retransmit = USB::GetConfigBool(si, port, TypeName(), "BetaUdpRetransmit", false);
+			s->beta_adaptive_playout = USB::GetConfigBool(si, port, TypeName(), "BetaAdaptivePlayout", false);
+			const int playout_max_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "BetaPlayoutMaxMs", 6), 0, 20);
+			s->beta_playout_max = std::chrono::milliseconds(playout_max_ms);
+			s->beta_global_stall_guard = USB::GetConfigBool(si, port, TypeName(), "BetaGlobalStallGuard", false);
+			Console.WriteLn(
+				"UePcb 1.6B BETA: Hold=%s(%dms) Retransmit=%s Playout=%s(max %dms) StallGuard=%s",
+				s->beta_sync_hold ? "ON" : "OFF", sync_hold_ms,
+				s->beta_udp_retransmit ? "ON" : "OFF",
+				s->beta_adaptive_playout ? "ON" : "OFF", playout_max_ms,
+				s->beta_global_stall_guard ? "ON" : "OFF");
 
 			// 1.3.3 shared Peer IP history. Boolean is now confirmed for native
 			// Remember/Clear checkboxes; peer history selection remains numeric
@@ -1364,7 +1612,7 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.5.1"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1408,9 +1656,9 @@ namespace usb_uepcb
 				.description = "0=Manual TCP Host IP, 1-10=shared saved address.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
 
 			{.type = SettingInfo::Type::Boolean, .name = "RememberCurrentIPs", .display_name = "Remember Current IPs",
-				.description = "Check and Apply/Save. UDP remembers resolved Peer1-3; TCP Client remembers the Host IP. Resets automatically.", .default_value = "false"},
+				.description = "UI action storage key. The custom UEPCB page uses a Save Current IPs push button.", .default_value = "false"},
 			{.type = SettingInfo::Type::Boolean, .name = "ClearIPHistory", .display_name = "Clear Shared IP History",
-				.description = "Check and Apply/Save to clear all 10 saved IPs and reset selectors to Manual. Resets automatically.", .default_value = "false"},
+				.description = "UI action storage key. The custom UEPCB page uses a Clear Saved IPs push button.", .default_value = "false"},
 
 			{.type = SettingInfo::Type::String, .name = "History1", .display_name = "Saved IP 1", .description = "Hidden history storage.", .default_value = ""},
 			{.type = SettingInfo::Type::String, .name = "History2", .display_name = "Saved IP 2", .description = "Hidden history storage.", .default_value = ""},
@@ -1430,6 +1678,21 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::Integer, .name = "JitterMinTarget", .display_name = "Minimum Target Buffer", .description = "UDP only. Default 1.", .default_value = "1", .min_value = "1", .max_value = "8", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 4.", .default_value = "4", .min_value = "1", .max_value = "8", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMaxPackets", .display_name = "Maximum Jitter Queue", .description = "UDP only. Default 8; keep small to avoid latency buildup.", .default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
+
+			// 1.6B Sync Priority beta switches. Defaults OFF preserve 1.5.1 behavior.
+			{.type = SettingInfo::Type::Boolean, .name = "BetaSyncHold", .display_name = "Beta: Sync Hold",
+				.description = "UDP beta. When a sequence is missing, wait a bounded time instead of immediately forced-skipping. Prioritizes synchronization over speed.", .default_value = "false"},
+			{.type = SettingInfo::Type::Integer, .name = "BetaSyncHoldMs", .display_name = "Sync Hold (ms)",
+				.description = "Maximum missing-packet hold when Beta Sync Hold is enabled. Default 30 ms.", .default_value = "30", .min_value = "3", .max_value = "100", .step_value = "1"},
+			{.type = SettingInfo::Type::Boolean, .name = "BetaUdpRetransmit", .display_name = "Beta: UDP Retransmit",
+				.description = "UDP beta. Requests a missing sequence from the sender. Best tested together with Sync Hold so the retransmission has time to arrive.", .default_value = "false"},
+			{.type = SettingInfo::Type::Boolean, .name = "BetaAdaptivePlayout", .display_name = "Beta: Adaptive Playout",
+				.description = "UDP beta. After real forced skips, adds a small common time-based playout delay which naturally decays with the target buffers.", .default_value = "false"},
+			{.type = SettingInfo::Type::Integer, .name = "BetaPlayoutMaxMs", .display_name = "Playout Max (ms)",
+				.description = "Maximum extra time-based playout delay for the beta adaptive playout mode. Default 6 ms.", .default_value = "6", .min_value = "0", .max_value = "20", .step_value = "1"},
+			{.type = SettingInfo::Type::Boolean, .name = "BetaGlobalStallGuard", .display_name = "Beta: Global Stall Guard",
+				.description = "UDP beta. If different peers forced-skip within 100 ms, treat it as a likely local emulator stall and avoid leaving several buffers enlarged.", .default_value = "false"},
+
 			{.type = SettingInfo::Type::String, .name = "MacHex", .display_name = "MAC 12-hex", .description = "Leave blank to auto-generate a unique MAC per emulator instance.", .default_value = ""}};
 		return settings;
 	}
