@@ -24,11 +24,12 @@ namespace usb_uepcb
 	class UePcbDevice final : public DeviceProxy
 	{
 	public:
+		USBDevice* CreateDevice(SettingsInterface& si, u32 port, u32 subtype) const override;
 		const char* Name() const override;
 		const char* TypeName() const override;
 		const char* IconName() const override;
-		USBDevice* CreateDevice(SettingsInterface& si, u32 port, u32 subtype) const override;
 		bool Freeze(USBDevice* dev, StateWrapper& sw) const override;
+		void UpdateSettings(USBDevice* dev, SettingsInterface& si) const override;
 		std::span<const SettingInfo> Settings(u32 subtype) const override;
 	};
 } // namespace usb_uepcb

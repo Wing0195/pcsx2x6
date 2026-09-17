@@ -620,7 +620,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-	// UE PCB 1.6B compact TCP/UDP layout. Detailed help is shown in one
+	// UE PCB 1.6.1B compact TCP/UDP layout. Detailed help is shown in one
 	// fixed description area at the bottom when the pointer enters a setting.
 	if (m_config_prefix == "UePcb_")
 	{
@@ -703,7 +703,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		auto maxQueue = addInt("JitterMaxPackets", tr("Maximum Jitter Queue"), 8, 1, 32, 1, current_row, 0);
 		auto broadcast = addString("TargetIP", tr("Broadcast Address"), "255.255.255.255", current_row, 2); current_row++;
 
-		// 1.6B Sync Priority beta switches. Each option is independent so the
+		// 1.6.1B Sync Priority beta switches. Each option is independent so the
 		// user can run clean A/B tests against the 1.5.1 baseline.
 		QCheckBox* betaSyncHold = new QCheckBox(tr("Beta: Sync Hold"), widget_parent);
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
@@ -711,20 +711,20 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		layout->addWidget(betaSyncHold, current_row, 0, 1, 2);
 		auto betaHoldMs = addInt("BetaSyncHoldMs", tr("Sync Hold (ms)"), 30, 3, 100, 1, current_row, 2); current_row++;
 
+		QCheckBox* betaPlayout = new QCheckBox(tr("Beta: Adaptive Playout"), widget_parent);
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, betaPlayout, m_config_section, m_config_prefix + "BetaAdaptivePlayout", false);
+		layout->addWidget(betaPlayout, current_row, 0, 1, 2);
+		auto betaPlayoutMax = addInt("BetaPlayoutMaxMs", tr("Playout Max (ms)"), 6, 0, 20, 1, current_row, 2); current_row++;
+
 		QCheckBox* betaRetransmit = new QCheckBox(tr("Beta: UDP Retransmit"), widget_parent);
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
 			sif, betaRetransmit, m_config_section, m_config_prefix + "BetaUdpRetransmit", false);
 		layout->addWidget(betaRetransmit, current_row, 0, 1, 2);
-		QCheckBox* betaPlayout = new QCheckBox(tr("Beta: Adaptive Playout"), widget_parent);
-		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
-			sif, betaPlayout, m_config_section, m_config_prefix + "BetaAdaptivePlayout", false);
-		layout->addWidget(betaPlayout, current_row, 2, 1, 2); current_row++;
-
 		QCheckBox* betaStallGuard = new QCheckBox(tr("Beta: Global Stall Guard"), widget_parent);
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
 			sif, betaStallGuard, m_config_section, m_config_prefix + "BetaGlobalStallGuard", false);
-		layout->addWidget(betaStallGuard, current_row, 0, 1, 2);
-		auto betaPlayoutMax = addInt("BetaPlayoutMaxMs", tr("Playout Max (ms)"), 6, 0, 20, 1, current_row, 2); current_row++;
+		layout->addWidget(betaStallGuard, current_row, 2, 1, 2); current_row++;
 
 		auto mac = addString("MacHex", tr("MAC 12-hex"), "", current_row, 0); current_row++;
 
@@ -763,13 +763,13 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		helpPair(broadcast, tr("Broadcast Address is used only in UDP when all three Direct Peer IPs are empty. Default: 255.255.255.255. It is useful for same-PC multi-instance and simple LAN broadcast testing."));
 		help(betaSyncHold, tr("Beta Sync Hold changes missing-packet handling from speed-first to synchronization-first. Instead of forced-skipping as soon as the normal jitter rule expires, UEPCB may hold the stream for the configured bounded time. This can create intentional slowdown during network instability while giving late packets time to recover."));
 		helpPair(betaHoldMs, tr("Sync Hold is the maximum bounded wait for a missing UDP sequence when Beta Sync Hold is enabled. Default: 30 ms. Higher values protect synchronization more aggressively but can create longer slowdown during genuine loss."));
-		help(betaRetransmit, tr("Beta UDP Retransmit sends emulator-only NACK requests for a missing sequence and keeps a short cache of recently transmitted packets. It is most meaningful together with Sync Hold, because the retransmitted packet needs time to return before a forced skip."));
+		help(betaRetransmit, tr("Beta UDP Retransmit now waits until a gap has persisted for 10 ms, then sends a NACK only to the actual sender. At most two requests are made, and a cached packet is retransmitted only to the requester. It is most meaningful together with Sync Hold."));
 		help(betaPlayout, tr("Beta Adaptive Playout adds a small common time-based delivery delay after real forced skips have raised the adaptive target buffer. Stable play adds no extra delay; stressed play can become slightly slower and more even. Disable it to use the 1.5.1 packet-count behavior."));
 		helpPair(betaPlayoutMax, tr("Playout Max limits the extra time-based delay used by Beta Adaptive Playout. Default: 6 ms. It is not ping compensation; it only caps the short smoothing delay applied after genuine network stress."));
 		help(betaStallGuard, tr("Beta Global Stall Guard watches for different peers forced-skipping within 100 ms. That pattern often resembles a local PCSX2/USB scheduling hitch rather than independent network loss, so the guard prevents several peer buffers from remaining enlarged after the local stall."));
 		helpPair(mac, tr("Leave MAC 12-hex blank so each emulator instance automatically generates a unique Namco MAC. Only enter 12 hexadecimal digits when a fixed MAC is specifically required."));
 
-		// 1.6B Save/Clear are one-shot push-button UI actions. CreateDevice stays read-only.
+		// 1.6.1B Save/Clear are one-shot push-button UI actions. CreateDevice stays read-only.
 		const auto refreshHistoryCombos = [=]() {
 			for (QComboBox* cb : {peer1hist.second, peer2hist.second, peer3hist.second, tcpHist.second})
 			{

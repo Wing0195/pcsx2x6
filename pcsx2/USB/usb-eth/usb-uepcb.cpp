@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.6B (Beta Sync Priority)
+// usb-uepcb1.6.1B (Beta Sync Priority)
 // Based on: Claude UePcb 1.3
 //
 // 1.5 changes:
@@ -79,6 +79,7 @@ using socket_t = SOCKET;
 #define UEPCB_INVALID_SOCKET INVALID_SOCKET
 #else
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -101,7 +102,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.6B (TCP/UDP Beta)", ""};
+		"", "Namco", "UE PCB v1.6.1B (TCP/UDP Beta)", ""};
 
 	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
 	// frame. This is purely an emulator-side addition (real UE PCB hardware
@@ -110,7 +111,7 @@ namespace usb_uepcb
 	// reordering per-peer without touching the AN986 driver protocol at all.
 	static constexpr int kWireTrailerSize = sizeof(u32);
 
-	// 1.6B emulator-only UDP recovery control packet.
+	// 1.6.1B emulator-only UDP recovery control packet.
 	// Layout (16 bytes): "UEPN", type, target MAC[6], missing seq (BE), reserved.
 	// Older UEPCB builds ignore it because it is shorter than an Ethernet frame
 	// plus the normal sequence trailer.
@@ -137,6 +138,7 @@ namespace usb_uepcb
 		size_t rx_offset = 0;
 
 		u8 mac[6] = {0x00, 0x90, 0x2E, 0x11, 0x22, 0x33};
+		u32 config_port = 0;
 		int udp_port = 7500;
 		std::string broadcast_ip;
 		std::array<std::string, 3> peer_ips{};
@@ -162,6 +164,10 @@ namespace usb_uepcb
 			std::chrono::steady_clock::time_point arrival{};
 			// Diagnostic only: packet arrived ahead of the then-current playback point.
 			bool diag_was_ahead = false;
+			// 1.6.1B diagnostic: records when Adaptive Playout actually held a
+			// packet beyond the legacy readiness point. It never changes timing.
+			bool diag_playout_held = false;
+			std::chrono::steady_clock::time_point diag_playout_hold_since{};
 		};
 
 		struct PeerJitter
@@ -188,7 +194,7 @@ namespace usb_uepcb
 			std::chrono::steady_clock::time_point gap_since{};
 			bool gap_active = false;
 
-			// 1.6B beta diagnostics/recovery state. These fields only affect
+			// 1.6.1B beta diagnostics/recovery state. These fields only affect
 			// behavior when the matching beta option is enabled.
 			std::chrono::steady_clock::time_point gap_last_nack{};
 			bool gap_nack_time_valid = false;
@@ -218,7 +224,7 @@ namespace usb_uepcb
 		std::chrono::milliseconds jitter_grace{3};
 		std::chrono::milliseconds jitter_decay_interval{4000};
 
-		// 1.6B Sync Priority beta features. Every feature is independently
+		// 1.6.1B Sync Priority beta features. Every feature is independently
 		// switchable so A/B testing can identify what actually helps.
 		bool beta_sync_hold = false;
 		std::chrono::milliseconds beta_sync_hold_time{30};
@@ -241,8 +247,18 @@ namespace usb_uepcb
 		};
 		std::deque<UdpCachedPacket> udp_tx_cache;
 		std::mutex udp_tx_cache_lock;
+
+		// 1.6.1B: learn the actual source endpoint for each Ethernet sender MAC.
+		// NACKs and retransmissions can then be sent only to the machine that
+		// needs them instead of flooding every configured peer/broadcast path.
+		std::unordered_map<u64, sockaddr_in> udp_peer_addrs;
+		std::mutex udp_peer_addrs_lock;
+
 		u64 diag_nack_rx = 0;
 		u64 diag_retransmit_tx = 0;
+		u64 diag_playout_events = 0;
+		u64 diag_playout_total_hold_ms = 0;
+		u64 diag_playout_max_hold_ms = 0;
 
 		// TCP transport. Host is an N-way hub; Client keeps one connection to Host.
 		bool tcp_is_host = true;
@@ -251,6 +267,7 @@ namespace usb_uepcb
 		std::string tcp_bind_ip = "0.0.0.0";
 		std::mutex tcp_sock_lock;
 		socket_t tcp_listen_sock = UEPCB_INVALID_SOCKET;
+		socket_t tcp_connect_sock = UEPCB_INVALID_SOCKET;
 		std::mutex tcp_peers_lock;
 		std::vector<socket_t> tcp_peers;
 
@@ -453,7 +470,7 @@ namespace usb_uepcb
 
 	static void udp_send_nack(UePcbState* s, u64 target_peer_key, u32 missing_seq);
 	static u32 read_be_u32(const u8* p);
-	static bool udp_resend_cached(UePcbState* s, u32 seq);
+	static bool udp_resend_cached(UePcbState* s, u32 seq, const sockaddr_in& requester);
 
 	static std::chrono::milliseconds beta_playout_delay_locked(const UePcbState* s)
 	{
@@ -513,6 +530,14 @@ namespace usb_uepcb
 					const bool playout_ready =
 						(!s->beta_adaptive_playout || age >= beta_playout_delay);
 
+					// Diagnostic only: remember the first moment a packet was already
+					// legacy-ready but Adaptive Playout intentionally kept it waiting.
+					if (legacy_ready && !playout_ready && !expected->second.diag_playout_held)
+					{
+						expected->second.diag_playout_held = true;
+						expected->second.diag_playout_hold_since = now;
+					}
+
 					if (legacy_ready && playout_ready)
 					{
 						if (!selected || expected->second.arrival < selected_arrival)
@@ -557,12 +582,13 @@ namespace usb_uepcb
 						jb.gap_hold_counted = true;
 					}
 
-					// Selective retransmission beta: after ordinary reorder grace
-					// has expired, request the exact missing sequence. Up to three
-					// NACKs are sent 8 ms apart while Sync Hold keeps the stream
-					// from advancing. This is emulator-side control traffic only.
-					if (s->beta_udp_retransmit && gap_age >= s->jitter_grace &&
-						jb.gap_nack_count < 3)
+					// 1.6.1B selective retransmission: do not NACK ordinary short
+					// reordering. The first request is delayed until 10 ms and, if the
+					// packet is still missing, one final request may follow 12 ms later.
+					// This is deliberately conservative; Sync Hold provides the time
+					// budget for a useful retransmission to return.
+					if (s->beta_udp_retransmit && gap_age.count() >= 10 &&
+						jb.gap_nack_count < 2)
 					{
 						bool nack_due = !jb.gap_nack_time_valid;
 						if (!nack_due)
@@ -570,7 +596,7 @@ namespace usb_uepcb
 							const auto since_nack =
 								std::chrono::duration_cast<std::chrono::milliseconds>(
 									now - jb.gap_last_nack);
-							nack_due = (since_nack.count() >= 8);
+							nack_due = (since_nack.count() >= 12);
 						}
 						if (nack_due)
 						{
@@ -618,6 +644,17 @@ namespace usb_uepcb
 
 			if (!selected_is_forced_skip && packet_it->second.diag_was_ahead)
 				++jb.diag_recovered;
+
+			if (packet_it->second.diag_playout_held)
+			{
+				const auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					now - packet_it->second.diag_playout_hold_since);
+				const u64 held = static_cast<u64>(std::max<long long>(0, held_ms.count()));
+				++s->diag_playout_events;
+				s->diag_playout_total_hold_ms += held;
+				if (held > s->diag_playout_max_hold_ms)
+					s->diag_playout_max_hold_ms = held;
+			}
 
 			s->pending_rx.push_back(std::move(packet_it->second.data));
 			jb.packets.erase(packet_it);
@@ -748,16 +785,21 @@ namespace usb_uepcb
 
 	static void tcp_remove_peer(UePcbState* s, socket_t p)
 	{
-		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
-		for (auto it = s->tcp_peers.begin(); it != s->tcp_peers.end(); ++it)
+		bool owned = false;
 		{
-			if (*it == p)
+			std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+			for (auto it = s->tcp_peers.begin(); it != s->tcp_peers.end(); ++it)
 			{
-				s->tcp_peers.erase(it);
-				break;
+				if (*it == p)
+				{
+					s->tcp_peers.erase(it);
+					owned = true;
+					break;
+				}
 			}
 		}
-		sock_close(p);
+		if (owned)
+			sock_close(p);
 	}
 
 	static void tcp_host_flood(UePcbState* s, socket_t src, const u8* eth, int len)
@@ -805,11 +847,36 @@ namespace usb_uepcb
 			socket_t conn = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 			if (conn != UEPCB_INVALID_SOCKET)
 			{
+				{
+					std::lock_guard<std::mutex> lk(s->tcp_sock_lock);
+					s->tcp_connect_sock = conn;
+				}
+
 				sockaddr_in a{};
 				a.sin_family = AF_INET;
 				a.sin_port = htons(static_cast<u16>(s->tcp_port));
-				if (inet_pton(AF_INET, s->tcp_host_ip.c_str(), &a.sin_addr) == 1 &&
-					connect(conn, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0)
+				const bool connected =
+					(inet_pton(AF_INET, s->tcp_host_ip.c_str(), &a.sin_addr) == 1 &&
+					 connect(conn, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+
+				bool still_owned = false;
+				{
+					std::lock_guard<std::mutex> lk(s->tcp_sock_lock);
+					if (s->tcp_connect_sock == conn)
+					{
+						s->tcp_connect_sock = UEPCB_INVALID_SOCKET;
+						still_owned = true;
+					}
+				}
+
+				if (s->thread_stop || !still_owned)
+				{
+					if (still_owned)
+						sock_close(conn);
+					break;
+				}
+
+				if (connected)
 				{
 					int nd = 1;
 					setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
@@ -819,16 +886,25 @@ namespace usb_uepcb
 					}
 					Console.WriteLn("UePcb: TCP CLIENT connected %s:%d", s->tcp_host_ip.c_str(), s->tcp_port);
 					tcp_client_recv_loop(s, conn);
+
+					bool owned = false;
 					{
 						std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
 						if (!s->tcp_peers.empty() && s->tcp_peers[0] == conn)
+						{
 							s->tcp_peers.clear();
+							owned = true;
+						}
 					}
-					sock_close(conn);
+					if (owned)
+						sock_close(conn);
 				}
 				else
+				{
 					sock_close(conn);
+				}
 			}
+
 			for (int i = 0; i < 20 && !s->thread_stop; ++i)
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		}
@@ -952,8 +1028,10 @@ namespace usb_uepcb
 
 			if (s->thread_stop)
 				break;
+			if (n <= 0)
+				continue;
 
-			// 1.6B emulator-only selective retransmission request.
+			// 1.6.1B emulator-only selective retransmission request.
 			if (n == kUdpControlSize &&
 				buf[0] == 'U' && buf[1] == 'E' && buf[2] == 'P' && buf[3] == 'N' &&
 				buf[4] == kUdpControlTypeNack)
@@ -962,8 +1040,8 @@ namespace usb_uepcb
 				{
 					++s->diag_nack_rx;
 					const u32 requested_seq = read_be_u32(buf + 11);
-					if (udp_resend_cached(s, requested_seq))
-						Console.WriteLn("UePcb BETA: retransmitted UDP seq %u", requested_seq);
+					if (udp_resend_cached(s, requested_seq, src_addr))
+						Console.WriteLn("UePcb BETA: retransmitted UDP seq %u to requester", requested_seq);
 				}
 				continue;
 			}
@@ -981,6 +1059,10 @@ namespace usb_uepcb
 			std::memcpy(&seq, buf + ethlen, sizeof(seq));
 
 			const u64 peer_key = mac_key(buf + 6);
+			{
+				std::lock_guard<std::mutex> lk(s->udp_peer_addrs_lock);
+				s->udp_peer_addrs[peer_key] = src_addr;
+			}
 
 			// Diagnostics only. They do not stall the receiver or emulator.
 			{
@@ -1093,24 +1175,25 @@ namespace usb_uepcb
 		peer_key_to_mac(target_peer_key, control + 5);
 		write_be_u32(control + 11, missing_seq);
 
-		// Send control traffic to configured peers. Also send the broadcast
-		// address once: this makes same-PC/broadcast testing more likely to
-		// reach the intended instance; the embedded target MAC makes it safe
-		// for unrelated UEPCB instances to ignore the request.
-		if (has_direct_peers(s))
+		sockaddr_in dst{};
+		bool have_dst = false;
 		{
-			for (const std::string& ip : s->peer_ips)
-				udp_send_to(s, ip, control, kUdpControlSize);
-			if (!s->broadcast_ip.empty())
-				udp_send_to(s, s->broadcast_ip, control, kUdpControlSize);
+			std::lock_guard<std::mutex> lk(s->udp_peer_addrs_lock);
+			const auto it = s->udp_peer_addrs.find(target_peer_key);
+			if (it != s->udp_peer_addrs.end())
+			{
+				dst = it->second;
+				have_dst = true;
+			}
 		}
-		else
-		{
-			udp_send_to(s, s->broadcast_ip, control, kUdpControlSize);
-		}
+		if (!have_dst)
+			return;
+
+		sendto(s->udp_sock, reinterpret_cast<const char*>(control), kUdpControlSize, 0,
+			reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
 	}
 
-	static bool udp_resend_cached(UePcbState* s, u32 seq)
+	static bool udp_resend_cached(UePcbState* s, u32 seq, const sockaddr_in& requester)
 	{
 		std::vector<u8> wire;
 		{
@@ -1125,10 +1208,14 @@ namespace usb_uepcb
 			}
 		}
 
-		if (wire.empty())
+		if (wire.empty() || s->udp_sock == UEPCB_INVALID_SOCKET)
 			return false;
 
-		udp_send_wire_to_destinations(s, wire.data(), static_cast<int>(wire.size()));
+		const int sent = sendto(s->udp_sock, reinterpret_cast<const char*>(wire.data()),
+			static_cast<int>(wire.size()), 0, reinterpret_cast<const sockaddr*>(&requester), sizeof(requester));
+		if (sent < 0)
+			return false;
+
 		++s->diag_retransmit_tx;
 		return true;
 	}
@@ -1385,9 +1472,109 @@ namespace usb_uepcb
 		}
 	}
 
-	static void uepcb_handle_destroy(USBDevice* dev)
+	static bool parse_mac_hex(const std::string& mh, u8* mac)
 	{
-		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
+		if (mh.size() < 12)
+			return false;
+		const auto hx = [](char c) -> int {
+			if (c >= '0' && c <= '9') return c - '0';
+			if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+			if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+			return -1;
+		};
+		for (int i = 0; i < 6; i++)
+		{
+			const int hi = hx(mh[i * 2]);
+			const int lo = hx(mh[i * 2 + 1]);
+			if (hi < 0 || lo < 0)
+				return false;
+			mac[i] = static_cast<u8>((hi << 4) | lo);
+		}
+		return true;
+	}
+
+	static void load_runtime_settings(UePcbState* s, SettingsInterface& si, u32 port, bool initial)
+	{
+		s->config_port = port;
+		s->connection_mode = std::clamp(USB::GetConfigInt(si, port, "UePcb", "ConnectionMode", 0), 0, 1);
+		s->advanced_settings = USB::GetConfigBool(si, port, "UePcb", "AdvancedSettings", false);
+		s->broadcast_ip = s->advanced_settings ?
+			USB::GetConfigString(si, port, "UePcb", "TargetIP", "255.255.255.255") : "255.255.255.255";
+		s->udp_port = USB::GetConfigInt(si, port, "UePcb", "Port", 7500);
+		s->tcp_port = s->udp_port;
+		s->tcp_is_host = (USB::GetConfigInt(si, port, "UePcb", "TCPRole", 0) == 0);
+		s->tcp_bind_ip = USB::GetConfigString(si, port, "UePcb", "TCPBindIP", "0.0.0.0");
+		s->tcp_host_ip = USB::GetConfigString(si, port, "UePcb", "TCPHostIP", "127.0.0.1");
+
+		const int grace_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterGraceMs", 3), 0, 20) : 3;
+		const int decay_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterDecayMs", 4000), 250, 60000) : 4000;
+		const int min_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterMinTarget", 1), 1, 8) : 1;
+		const int max_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterMaxTarget", 4), min_target, 8) : 4;
+		const int max_packets = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterMaxPackets", 8), max_target, 32) : 8;
+		s->jitter_grace = std::chrono::milliseconds(grace_ms);
+		s->jitter_decay_interval = std::chrono::milliseconds(decay_ms);
+		s->jitter_min_target = static_cast<u32>(min_target);
+		s->jitter_max_target = static_cast<u32>(max_target);
+		s->jitter_max_packets = static_cast<size_t>(max_packets);
+
+		s->beta_sync_hold = USB::GetConfigBool(si, port, "UePcb", "BetaSyncHold", false);
+		const int sync_hold_ms = std::clamp(USB::GetConfigInt(si, port, "UePcb", "BetaSyncHoldMs", 30), 3, 100);
+		s->beta_sync_hold_time = std::chrono::milliseconds(sync_hold_ms);
+		s->beta_udp_retransmit = USB::GetConfigBool(si, port, "UePcb", "BetaUdpRetransmit", false);
+		s->beta_adaptive_playout = USB::GetConfigBool(si, port, "UePcb", "BetaAdaptivePlayout", false);
+		const int playout_max_ms = std::clamp(USB::GetConfigInt(si, port, "UePcb", "BetaPlayoutMaxMs", 6), 0, 20);
+		s->beta_playout_max = std::chrono::milliseconds(playout_max_ms);
+		s->beta_global_stall_guard = USB::GetConfigBool(si, port, "UePcb", "BetaGlobalStallGuard", false);
+
+		static constexpr int kHistorySlots = 10;
+		std::array<std::string, kHistorySlots> history{};
+		for (int i = 0; i < kHistorySlots; ++i)
+		{
+			const std::string key = "History" + std::to_string(i + 1);
+			history[i] = USB::GetConfigString(si, port, "UePcb", key.c_str(), "");
+		}
+
+		const int tcp_history_slot = USB::GetConfigInt(si, port, "UePcb", "TCPHostHistorySlot", 0);
+		if (tcp_history_slot >= 1 && tcp_history_slot <= kHistorySlots && !history[tcp_history_slot - 1].empty())
+			s->tcp_host_ip = history[tcp_history_slot - 1];
+
+		for (int i = 0; i < 3; ++i)
+		{
+			const std::string ip_key = "Peer" + std::to_string(i + 1) + "IP";
+			s->peer_ips[i] = USB::GetConfigString(si, port, "UePcb", ip_key.c_str(), "");
+			const std::string slot_key = "Peer" + std::to_string(i + 1) + "HistorySlot";
+			const int slot = USB::GetConfigInt(si, port, "UePcb", slot_key.c_str(), 0);
+			if (slot >= 1 && slot <= kHistorySlots && !history[slot - 1].empty())
+				s->peer_ips[i] = history[slot - 1];
+		}
+
+		const std::string mh = USB::GetConfigString(si, port, "UePcb", "MacHex", "");
+		u8 new_mac[6] = {};
+		if (parse_mac_hex(mh, new_mac))
+		{
+			std::memcpy(s->mac, new_mac, 6);
+		}
+		else if (initial)
+		{
+			static std::mt19937 rng(std::random_device{}());
+			const u32 r = rng();
+			s->mac[0] = 0x00; s->mac[1] = 0x90; s->mac[2] = 0x2E;
+			s->mac[3] = static_cast<u8>(r & 0xFF);
+			s->mac[4] = static_cast<u8>((r >> 8) & 0xFF);
+			s->mac[5] = static_cast<u8>((r >> 16) & 0xFF);
+		}
+		std::memcpy(s->an986_regs + 0x10, s->mac, 6);
+
+		Console.WriteLn("UePcb 1.6.1B settings: mode=%s port=%d Hold=%s(%dms) Retransmit=%s Playout=%s(max %dms) StallGuard=%s",
+			s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
+			s->beta_sync_hold ? "ON" : "OFF", sync_hold_ms,
+			s->beta_udp_retransmit ? "ON" : "OFF",
+			s->beta_adaptive_playout ? "ON" : "OFF", playout_max_ms,
+			s->beta_global_stall_guard ? "ON" : "OFF");
+	}
+
+	static void stop_transport(UePcbState* s)
+	{
 		s->thread_stop = true;
 
 		if (s->udp_sock != UEPCB_INVALID_SOCKET)
@@ -1402,6 +1589,11 @@ namespace usb_uepcb
 				sock_close(s->tcp_listen_sock);
 				s->tcp_listen_sock = UEPCB_INVALID_SOCKET;
 			}
+			if (s->tcp_connect_sock != UEPCB_INVALID_SOCKET)
+			{
+				sock_close(s->tcp_connect_sock);
+				s->tcp_connect_sock = UEPCB_INVALID_SOCKET;
+			}
 		}
 		{
 			std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
@@ -1412,6 +1604,87 @@ namespace usb_uepcb
 		}
 		if (s->recv_thread.joinable())
 			s->recv_thread.join();
+	}
+
+	static void clear_transport_queues(UePcbState* s)
+	{
+		{
+			std::lock_guard<std::mutex> lk(s->jitter_lock);
+			s->peer_jitter.clear();
+			s->diag_last_forced_valid = false;
+		}
+		{
+			std::lock_guard<std::mutex> lk(s->pending_lock);
+			s->pending_rx.clear();
+		}
+		{
+			std::lock_guard<std::mutex> lk(s->in_lock);
+			s->in_q.clear();
+			// Do not touch rx_partial here. The emulated USB thread may be
+			// finishing a packet already handed to EP1 while Apply restarts
+			// only the host transport. Let that partial packet complete.
+		}
+		{
+			std::lock_guard<std::mutex> lk(s->udp_tx_cache_lock);
+			s->udp_tx_cache.clear();
+		}
+		{
+			std::lock_guard<std::mutex> lk(s->udp_peer_addrs_lock);
+			s->udp_peer_addrs.clear();
+		}
+	}
+
+	static bool start_transport(UePcbState* s)
+	{
+		s->thread_stop = false;
+		if (s->connection_mode == 0)
+		{
+			s->udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+			if (s->udp_sock == UEPCB_INVALID_SOCKET)
+			{
+				Console.Error("UePcb: UDP socket creation failed");
+				return false;
+			}
+			int one = 1;
+			setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
+			setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
+			int rcvbuf = 256 * 1024;
+			setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+#ifdef _WIN32
+			DWORD recv_timeout_ms = 200;
+			setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
+#else
+			timeval recv_timeout{0, 200000};
+			setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout), sizeof(recv_timeout));
+#endif
+
+			sockaddr_in bind_addr{};
+			bind_addr.sin_family = AF_INET;
+			bind_addr.sin_port = htons(static_cast<u16>(s->udp_port));
+			bind_addr.sin_addr.s_addr = INADDR_ANY;
+			if (bind(s->udp_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0)
+			{
+				Console.Error("UePcb: UDP bind port %d FAILED", s->udp_port);
+				sock_close(s->udp_sock);
+				s->udp_sock = UEPCB_INVALID_SOCKET;
+				return false;
+			}
+			s->recv_thread = std::thread(udp_recv_loop, s);
+			return true;
+		}
+
+		Console.WriteLn("UePcb: TCP mode role=%s port=%d %s=%s",
+			s->tcp_is_host ? "HOST" : "CLIENT", s->tcp_port,
+			s->tcp_is_host ? "listen" : "host",
+			s->tcp_is_host ? s->tcp_bind_ip.c_str() : s->tcp_host_ip.c_str());
+		s->recv_thread = std::thread(tcp_transport_loop, s);
+		return true;
+	}
+
+	static void uepcb_handle_destroy(USBDevice* dev)
+	{
+		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
+		stop_transport(s);
 
 		if (s->connection_mode == 0)
 		{
@@ -1434,9 +1707,12 @@ namespace usb_uepcb
 					static_cast<unsigned long long>(jb.diag_max_gap_ms),
 					jb.target_packets, jb.packets.size());
 			}
-			Console.WriteLn("UePcb BETA summary NackRX=%llu RetransmitTX=%llu",
+			Console.WriteLn("UePcb BETA summary NackRX=%llu RetransmitTX=%llu PlayoutEvents=%llu PlayoutHoldTotalMs=%llu PlayoutHoldMaxMs=%llu",
 				static_cast<unsigned long long>(s->diag_nack_rx),
-				static_cast<unsigned long long>(s->diag_retransmit_tx));
+				static_cast<unsigned long long>(s->diag_retransmit_tx),
+				static_cast<unsigned long long>(s->diag_playout_events),
+				static_cast<unsigned long long>(s->diag_playout_total_hold_ms),
+				static_cast<unsigned long long>(s->diag_playout_max_hold_ms));
 		}
 		delete s;
 	}
@@ -1445,144 +1721,7 @@ namespace usb_uepcb
 	{
 		wsa_ensure();
 		UePcbState* s = new UePcbState();
-		{
-			s->connection_mode = std::clamp(USB::GetConfigInt(si, port, TypeName(), "ConnectionMode", 0), 0, 1);
-			s->advanced_settings = USB::GetConfigBool(si, port, TypeName(), "AdvancedSettings", false);
-			s->broadcast_ip = s->advanced_settings ?
-				USB::GetConfigString(si, port, TypeName(), "TargetIP", "255.255.255.255") : "255.255.255.255";
-			s->udp_port = USB::GetConfigInt(si, port, TypeName(), "Port", 7500);
-			s->tcp_port = s->udp_port;
-			s->tcp_is_host = (USB::GetConfigInt(si, port, TypeName(), "TCPRole", 0) == 0);
-			s->tcp_bind_ip = USB::GetConfigString(si, port, TypeName(), "TCPBindIP", "0.0.0.0");
-			s->tcp_host_ip = USB::GetConfigString(si, port, TypeName(), "TCPHostIP", "127.0.0.1");
-			const int tcp_history_slot = USB::GetConfigInt(si, port, TypeName(), "TCPHostHistorySlot", 0);
-
-			// 1.3.3 manual adaptive jitter tuning. Clamp values defensively so a
-			// typo cannot create an unbounded queue or excessive wait.
-			const int grace_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterGraceMs", 3), 0, 20) : 3;
-			const int decay_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterDecayMs", 4000), 250, 60000) : 4000;
-			const int min_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMinTarget", 1), 1, 8) : 1;
-			const int max_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxTarget", 4), min_target, 8) : 4;
-			const int max_packets = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, TypeName(), "JitterMaxPackets", 8), max_target, 32) : 8;
-			s->jitter_grace = std::chrono::milliseconds(grace_ms);
-			s->jitter_decay_interval = std::chrono::milliseconds(decay_ms);
-			s->jitter_min_target = static_cast<u32>(min_target);
-			s->jitter_max_target = static_cast<u32>(max_target);
-			s->jitter_max_packets = static_cast<size_t>(max_packets);
-			Console.WriteLn("UePcb: Jitter tuning Grace=%dms Decay=%dms Min=%d Max=%d Queue=%d",
-				grace_ms, decay_ms, min_target, max_target, max_packets);
-
-			// 1.6B beta options are deliberately independent for clean A/B tests.
-			s->beta_sync_hold = USB::GetConfigBool(si, port, TypeName(), "BetaSyncHold", false);
-			const int sync_hold_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "BetaSyncHoldMs", 30), 3, 100);
-			s->beta_sync_hold_time = std::chrono::milliseconds(sync_hold_ms);
-			s->beta_udp_retransmit = USB::GetConfigBool(si, port, TypeName(), "BetaUdpRetransmit", false);
-			s->beta_adaptive_playout = USB::GetConfigBool(si, port, TypeName(), "BetaAdaptivePlayout", false);
-			const int playout_max_ms = std::clamp(USB::GetConfigInt(si, port, TypeName(), "BetaPlayoutMaxMs", 6), 0, 20);
-			s->beta_playout_max = std::chrono::milliseconds(playout_max_ms);
-			s->beta_global_stall_guard = USB::GetConfigBool(si, port, TypeName(), "BetaGlobalStallGuard", false);
-			Console.WriteLn(
-				"UePcb 1.6B BETA: Hold=%s(%dms) Retransmit=%s Playout=%s(max %dms) StallGuard=%s",
-				s->beta_sync_hold ? "ON" : "OFF", sync_hold_ms,
-				s->beta_udp_retransmit ? "ON" : "OFF",
-				s->beta_adaptive_playout ? "ON" : "OFF", playout_max_ms,
-				s->beta_global_stall_guard ? "ON" : "OFF");
-
-			// 1.3.3 shared Peer IP history. Boolean is now confirmed for native
-			// Remember/Clear checkboxes; peer history selection remains numeric
-			// until a dynamic editable list UI is intentionally added later.
-			static constexpr int kHistorySlots = 10;
-			std::array<std::string, kHistorySlots> history{};
-			for (int i = 0; i < kHistorySlots; ++i)
-			{
-				const std::string key = "History" + std::to_string(i + 1);
-				history[i] = USB::GetConfigString(si, port, TypeName(), key.c_str(), "");
-			}
-
-			if (tcp_history_slot >= 1 && tcp_history_slot <= kHistorySlots && !history[tcp_history_slot - 1].empty())
-				s->tcp_host_ip = history[tcp_history_slot - 1];
-
-
-			// 1.5.1: IP history mutations are UI actions now. CreateDevice only
-			// reads settings. Writing SettingsInterface from this path can run while
-			// PCSX2 holds its settings lock and was the cause of the Save/Clear crash.
-			std::array<std::string, 3> manual_peer_ips{};
-			for (int i = 0; i < 3; ++i)
-			{
-				const std::string ip_key = "Peer" + std::to_string(i + 1) + "IP";
-				manual_peer_ips[i] = USB::GetConfigString(si, port, TypeName(), ip_key.c_str(), "");
-				s->peer_ips[i] = manual_peer_ips[i];
-
-				const std::string slot_key = "Peer" + std::to_string(i + 1) + "HistorySlot";
-				const int slot = USB::GetConfigInt(si, port, TypeName(), slot_key.c_str(), 0);
-				if (slot >= 1 && slot <= kHistorySlots && !history[slot - 1].empty())
-					s->peer_ips[i] = history[slot - 1];
-			}
-
-			for (int i = 0; i < 3; ++i)
-			{
-				Console.WriteLn("UePcb: Peer%d resolved IP = %s", i + 1,
-					s->peer_ips[i].empty() ? "<empty>" : s->peer_ips[i].c_str());
-			}
-
-			const std::string mh = USB::GetConfigString(si, port, TypeName(), "MacHex", "");
-			if (mh.size() >= 12)
-			{
-				const auto hx = [](char c) -> int {
-					if (c >= '0' && c <= '9') return c - '0';
-					if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-					if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-					return 0;
-				};
-				for (int i = 0; i < 6; i++)
-					s->mac[i] = static_cast<u8>((hx(mh[i * 2]) << 4) | hx(mh[i * 2 + 1]));
-			}
-			else
-			{
-				static std::mt19937 rng(std::random_device{}());
-				const u32 r = rng();
-				s->mac[0] = 0x00; s->mac[1] = 0x90; s->mac[2] = 0x2E;
-				s->mac[3] = static_cast<u8>(r & 0xFF);
-				s->mac[4] = static_cast<u8>((r >> 8) & 0xFF);
-				s->mac[5] = static_cast<u8>((r >> 16) & 0xFF);
-			}
-
-			if (s->connection_mode == 0)
-			{
-			s->udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-			if (s->udp_sock != UEPCB_INVALID_SOCKET)
-			{
-				int one = 1;
-				setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
-				setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
-
-				// Give the kernel receive buffer more headroom than the tiny
-				// OS default. Under a burst (host briefly stalls a frame,
-				// e.g. a hitch from disk I/O or GC), a small kernel buffer
-				// overflows and silently drops datagrams before
-				// udp_recv_loop() ever reads them - a loss that's invisible
-				// even to the new seq-gap logging above, since the packet
-				// never reaches userland at all.
-				int rcvbuf = 256 * 1024;
-				setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
-
-				sockaddr_in bind_addr{};
-				bind_addr.sin_family = AF_INET;
-				bind_addr.sin_port = htons(static_cast<u16>(s->udp_port));
-				bind_addr.sin_addr.s_addr = INADDR_ANY;
-
-				bind(s->udp_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr));
-			}
-			}
-			else
-			{
-				Console.WriteLn("UePcb: TCP mode role=%s port=%d %s=%s",
-					s->tcp_is_host ? "HOST" : "CLIENT", s->tcp_port,
-					s->tcp_is_host ? "listen" : "host",
-					s->tcp_is_host ? s->tcp_bind_ip.c_str() : s->tcp_host_ip.c_str());
-			}
-
-		}
+		load_runtime_settings(s, si, port, true);
 
 		s->dev.speed = USB_SPEED_FULL;
 		s->desc.full = &s->desc_dev;
@@ -1604,7 +1743,8 @@ namespace usb_uepcb
 		usb_desc_init(&s->dev);
 		usb_ep_init(&s->dev);
 		uepcb_handle_reset(&s->dev);
-		s->recv_thread = (s->connection_mode == 1) ? std::thread(tcp_transport_loop, s) : std::thread(udp_recv_loop, s);
+		if (!start_transport(s))
+			Console.Warning("UePcb: transport could not start; change settings and Apply to retry without restarting the game.");
 		return &s->dev;
 
 	fail:
@@ -1612,7 +1752,24 @@ namespace usb_uepcb
 		return nullptr;
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6B"; }
+	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
+	{
+		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
+		Console.WriteLn("UePcb 1.6.1B: applying settings live (transport restart only; game stays running)");
+
+		// Stop socket/thread activity before changing strings, ports or mode.
+		// tx_seq deliberately survives so remote peers do not see our UDP
+		// sequence counter jump backwards after an Apply.
+		stop_transport(s);
+		clear_transport_queues(s);
+		load_runtime_settings(s, si, s->config_port, false);
+		if (!start_transport(s))
+			Console.Error("UePcb 1.6.1B: live Apply completed, but transport restart failed");
+		else
+			Console.WriteLn("UePcb 1.6.1B: live Apply complete");
+	}
+
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6.1B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1685,7 +1842,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::Integer, .name = "BetaSyncHoldMs", .display_name = "Sync Hold (ms)",
 				.description = "Maximum missing-packet hold when Beta Sync Hold is enabled. Default 30 ms.", .default_value = "30", .min_value = "3", .max_value = "100", .step_value = "1"},
 			{.type = SettingInfo::Type::Boolean, .name = "BetaUdpRetransmit", .display_name = "Beta: UDP Retransmit",
-				.description = "UDP beta. Requests a missing sequence from the sender. Best tested together with Sync Hold so the retransmission has time to arrive.", .default_value = "false"},
+				.description = "UDP beta. After a gap has persisted for 10 ms, sends a peer-directed NACK only to the actual sender. At most two requests are made; retransmission is returned only to the requester. Best used with Sync Hold.", .default_value = "false"},
 			{.type = SettingInfo::Type::Boolean, .name = "BetaAdaptivePlayout", .display_name = "Beta: Adaptive Playout",
 				.description = "UDP beta. After real forced skips, adds a small common time-based playout delay which naturally decays with the target buffers.", .default_value = "false"},
 			{.type = SettingInfo::Type::Integer, .name = "BetaPlayoutMaxMs", .display_name = "Playout Max (ms)",
