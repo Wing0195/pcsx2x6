@@ -979,3 +979,4 @@ namespace usb_uepcb
 		return settings;
 	}
 } // namespace usb_uepcb
+
