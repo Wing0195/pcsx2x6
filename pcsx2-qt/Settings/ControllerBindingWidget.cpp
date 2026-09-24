@@ -620,7 +620,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-	// UE PCB 1.6.2B compact TCP/UDP layout. Detailed help is shown in one
+	// UE PCB 1.6.3B compact TCP/UDP + multi-instance endpoint layout. Detailed help is shown in one
 	// fixed description area at the bottom when the pointer enters a setting.
 	if (m_config_prefix == "UePcb_")
 	{
@@ -645,17 +645,22 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			layout->addWidget(l, row, col); layout->addWidget(sb, row, col + 1);
 			return std::pair<QLabel*, QSpinBox*>(l, sb);
 		};
-		const auto addHistoryCombo = [&](const char* slot_key, const QString& label, int row, int col) {
+		const auto addEditableIPCombo = [&](const char* key, const QString& label, const char* def, int row, int col) {
 			QLabel* l = new QLabel(label, widget_parent);
-			QComboBox* cb = new QComboBox(widget_parent); cb->setObjectName(QString::fromUtf8(slot_key));
-			cb->addItem(tr("Manual"));
+			QComboBox* cb = new QComboBox(widget_parent);
+			cb->setEditable(true);
+			cb->setInsertPolicy(QComboBox::NoInsert);
+			cb->setObjectName(QString::fromUtf8(key) + QStringLiteral("Combo"));
 			for (int i = 1; i <= 10; i++)
 			{
-				const std::string key = m_config_prefix + fmt::format("History{}", i);
-				const std::string ip = m_dialog->getStringValue(m_config_section.c_str(), key.c_str(), "");
-				cb->addItem(ip.empty() ? tr("Saved IP %1 - (empty)").arg(i) : tr("Saved IP %1 - %2").arg(i).arg(QString::fromStdString(ip)));
+				const std::string history_key = m_config_prefix + fmt::format("History{}", i);
+				const std::string ip = m_dialog->getStringValue(m_config_section.c_str(), history_key.c_str(), "");
+				if (!ip.empty() && cb->findText(QString::fromStdString(ip)) < 0)
+					cb->addItem(QString::fromStdString(ip));
 			}
-			ControllerSettingWidgetBinder::BindWidgetToInputProfileInt(sif, cb, m_config_section, m_config_prefix + slot_key, 0, 0);
+			cb->lineEdit()->setObjectName(QString::fromUtf8(key));
+			ControllerSettingWidgetBinder::BindWidgetToInputProfileString(
+				sif, cb->lineEdit(), m_config_section, m_config_prefix + key, def);
 			layout->addWidget(l, row, col); layout->addWidget(cb, row, col + 1);
 			return std::pair<QLabel*, QComboBox*>(l, cb);
 		};
@@ -665,14 +670,17 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		mode->addItem(tr("UDP")); mode->addItem(tr("TCP"));
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileInt(sif, mode, m_config_section, m_config_prefix + "ConnectionMode", 0, 0);
 		layout->addWidget(modeLabel, current_row, 0); layout->addWidget(mode, current_row, 1);
-		auto portPair = addInt("Port", tr("Network Port"), 7500, 1, 65535, 1, current_row, 2); current_row++;
+		auto portPair = addInt("Port", tr("Local UDP Port"), 7500, 1, 65535, 1, current_row, 2); current_row++;
 
-		auto peer1 = addString("Peer1IP", tr("Direct Peer 1 IP"), "", current_row, 0);
-		auto peer1hist = addHistoryCombo("Peer1HistorySlot", tr("Saved IP"), current_row, 2); current_row++;
-		auto peer2 = addString("Peer2IP", tr("Direct Peer 2 IP"), "", current_row, 0);
-		auto peer2hist = addHistoryCombo("Peer2HistorySlot", tr("Saved IP"), current_row, 2); current_row++;
-		auto peer3 = addString("Peer3IP", tr("Direct Peer 3 IP"), "", current_row, 0);
-		auto peer3hist = addHistoryCombo("Peer3HistorySlot", tr("Saved IP"), current_row, 2); current_row++;
+		// 1.6.3B: editable IP history and an explicit destination port form one
+		// complete UDP endpoint. Saved IPs are now selected directly inside the
+		// IP field, removing the old Manual-vs-Saved ambiguity.
+		auto peer1 = addEditableIPCombo("Peer1IP", tr("Direct Peer 1 IP"), "", current_row, 0);
+		auto peer1port = addInt("Peer1Port", tr("Port"), 7500, 1, 65535, 1, current_row, 2); current_row++;
+		auto peer2 = addEditableIPCombo("Peer2IP", tr("Direct Peer 2 IP"), "", current_row, 0);
+		auto peer2port = addInt("Peer2Port", tr("Port"), 7500, 1, 65535, 1, current_row, 2); current_row++;
+		auto peer3 = addEditableIPCombo("Peer3IP", tr("Direct Peer 3 IP"), "", current_row, 0);
+		auto peer3port = addInt("Peer3Port", tr("Port"), 7500, 1, 65535, 1, current_row, 2); current_row++;
 
 		QLabel* roleLabel = new QLabel(tr("TCP Role"), widget_parent);
 		QComboBox* role = new QComboBox(widget_parent); role->setObjectName(QStringLiteral("TCPRole"));
@@ -680,8 +688,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileInt(sif, role, m_config_section, m_config_prefix + "TCPRole", 0, 0);
 		layout->addWidget(roleLabel, current_row, 0); layout->addWidget(role, current_row, 1);
 		auto bindPair = addString("TCPBindIP", tr("Listen IP"), "0.0.0.0", current_row, 2); current_row++;
-		auto hostPair = addString("TCPHostIP", tr("TCP Host IP"), "127.0.0.1", current_row, 0);
-		auto tcpHist = addHistoryCombo("TCPHostHistorySlot", tr("Saved IP"), current_row, 2); current_row++;
+		auto hostPair = addEditableIPCombo("TCPHostIP", tr("TCP Host IP"), "127.0.0.1", current_row, 0); current_row++;
 
 		// Save/Clear are one-shot actions, so push buttons are clearer than
 		// checkboxes (there is no persistent on/off state to display).
@@ -703,7 +710,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		auto maxQueue = addInt("JitterMaxPackets", tr("Maximum Jitter Queue"), 8, 1, 32, 1, current_row, 0);
 		auto broadcast = addString("TargetIP", tr("Broadcast Address"), "255.255.255.255", current_row, 2); current_row++;
 
-		// 1.6.2B Sync Priority controls. Sync Hold is the recommended baseline;
+		// 1.6.3B Sync Priority controls. Sync Hold is the recommended baseline;
 		// the remaining switches stay independent for A/B testing.
 		// Keep both primary timing controls on one compact row. The units live
 		// inside the spin boxes; detailed meanings are in the hover Description.
@@ -760,64 +767,72 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		const auto help = [&](QWidget* w, const QString& text) { w->setProperty("uepcb_description", text); w->installEventFilter(helpFilter); };
 		const auto helpPair = [&](auto pair, const QString& text) { help(pair.first, text); help(pair.second, text); };
 
-		const QString modeHelp = tr("UDP is the recommended low-latency mode and supports Direct Peer IPs or automatic LAN broadcast. TCP uses a Host/Client hub: one Host accepts the other players and relays Ethernet frames between them. All players must use the same Network Port (default 7500).");
+		const auto helpEditablePair = [&](auto pair, const QString& text) {
+			help(pair.first, text);
+			help(pair.second, text);
+			if (pair.second->lineEdit())
+				help(pair.second->lineEdit(), text);
+		};
+
+		const QString modeHelp = tr("UDP is the recommended low-latency mode. In UDP, Local UDP Port is this emulator instance's receive port; each Direct Peer uses its own IP + destination Port. Same-PC multi-instance play must give every emulator a unique Local UDP Port, for example 7500, 7501, 7502 and 7503. TCP keeps the existing Host/Client hub and uses the main port as its TCP connection port.");
 		help(modeLabel, modeHelp); help(mode, modeHelp); helpPair(portPair, modeHelp);
-		const QString udpHelp = tr("UDP mode: each machine only needs the other players' addresses. In a 4-player game, enter the other three peers and never the local machine's own IP. Choose Manual to use the text field, or select an address from the shared Saved IP history. If all three peers are empty, UEPCB automatically uses Broadcast Address.");
-		helpPair(peer1, udpHelp); helpPair(peer1hist, udpHelp); helpPair(peer2, udpHelp); helpPair(peer2hist, udpHelp); helpPair(peer3, udpHelp); helpPair(peer3hist, udpHelp);
+		const QString udpHelp = tr("UDP Direct Peer routing uses a complete endpoint: IP + Port. The IP field is editable, and its drop-down directly lists the shared saved-IP history; selecting an item simply fills that IP into the same field. For a 4-player game, enter the other three emulator endpoints and do not enter this instance's own endpoint. If all three peer IPs are empty, UEPCB falls back to Broadcast Address on the Local UDP Port.");
+		helpEditablePair(peer1, udpHelp); helpPair(peer1port, udpHelp);
+		helpEditablePair(peer2, udpHelp); helpPair(peer2port, udpHelp);
+		helpEditablePair(peer3, udpHelp); helpPair(peer3port, udpHelp);
 		const QString tcpRoleHelp = tr("TCP Host accepts the other players and relays Ethernet frames. TCP Client connects to that Host. TCP uses an N-way Host hub and TCP_NODELAY and does not use the UDP adaptive jitter buffer.");
 		help(roleLabel, tcpRoleHelp); help(role, tcpRoleHelp);
 		helpPair(bindPair, tr("TCP Host Listen IP: 0.0.0.0 accepts connections on all LAN/VPN adapters. Use 127.0.0.1 only when every instance is on the same PC. This field is ignored in TCP Client mode."));
-		helpPair(hostPair, tr("TCP Client Host IP: use 127.0.0.1 for same-PC play. Across LAN or VPN, enter the Host machine's LAN/Tailscale/VPN address. You may also select the Host from the shared Saved IP history."));
-		helpPair(tcpHist, tr("Choose Manual to use TCP Host IP, or select one of the shared Saved IP 1-10 entries."));
-		const QString rememberHelp = tr("Save Current IPs stores the currently resolved addresses into the shared 10-entry history immediately. UDP saves Peer 1-3; TCP Client saves the Host IP. Recent addresses move to the front and duplicates are removed.");
+		helpEditablePair(hostPair, tr("TCP Client Host IP is now also an editable saved-IP drop-down. Type an address directly or select one from the shared history. Use 127.0.0.1 for same-PC TCP; across LAN or VPN, use the Host machine's LAN/Tailscale/VPN address."));
+		const QString rememberHelp = tr("Save Current IPs stores the current Peer 1-3 IP fields, or the TCP Client Host IP, into the shared 10-entry history immediately. Recent addresses move to the front and duplicates are removed. Ports are not stored in IP history.");
 		help(remember, rememberHelp);
-		help(clear, tr("Clear Saved IPs immediately erases all ten saved addresses and returns all UDP/TCP Saved IP selectors to Manual."));
+		help(clear, tr("Clear Saved IPs erases all ten saved addresses and also clears the current UDP Peer IP and TCP Host IP fields. Peer port values are left unchanged."));
 		help(advanced, tr("Leave Advanced Settings unchecked for the proven UDP defaults: Jitter Grace 3 ms, Buffer Decay 4000 ms, Minimum Target 1, Maximum Target 4 and Queue 8. Enable it to unlock manual UDP jitter tuning and Broadcast Address. TCP bypasses these controls."));
 		helpPair(grace, tr("Jitter Grace is how long a missing UDP sequence may recover before a forced skip. Default: 3 ms."));
 		helpPair(decay, tr("Buffer Decay is the stable playback time before the adaptive target buffer drops by one step. Default: 4000 ms; 8000-12000 ms can be useful smoothness tests."));
 		helpPair(minTarget, tr("Minimum Target Buffer sets the lowest adaptive UDP playback depth. Default: 1."));
 		helpPair(maxTarget, tr("Maximum Target Buffer limits how far the adaptive UDP playback depth can grow. Default: 4."));
 		helpPair(maxQueue, tr("Maximum Jitter Queue is the hard per-peer UDP holding limit. Default: 8. Increasing it too far can accumulate latency."));
-		helpPair(broadcast, tr("Broadcast Address is used only in UDP when all three Direct Peer IPs are empty. Default: 255.255.255.255. It is useful for same-PC multi-instance and simple LAN broadcast testing."));
+		helpPair(broadcast, tr("Broadcast Address is used only in UDP when all three Direct Peer IPs are empty. Default: 255.255.255.255. Broadcast uses this instance's Local UDP Port; for reliable same-PC multi-instance routing, use explicit Direct Peer IP + Port endpoints instead."));
 		const QString syncHoldHelp = tr("Sync Hold is the recommended synchronization-first option. When a UDP sequence is missing, UEPCB waits for a bounded time instead of immediately forced-skipping. Three-machine Wi-Fi testing recovered more than 99% of ahead/reordered packets with only two forced skips using 30 ms. Recommended: enable Sync Hold; 30 ms is the current starting value. The number shown beside it is the maximum Sync Hold time in milliseconds.");
 		help(betaSyncHold, syncHoldHelp);
 		help(betaHoldMs, syncHoldHelp);
-		const QString playoutHelp = tr("Adaptive Playout is optional. After a real forced skip raises the adaptive target buffer, UEPCB adds a small common delivery delay to smooth stressed play. 1.6.2B uses a gentler 1 ms per buffer step and a default ceiling of 3 ms. The number shown beside it is Playout Max in milliseconds. Note: the observed hold may exceed this target because delivery occurs on the next USB poll; keep the value small.");
+		const QString playoutHelp = tr("Adaptive Playout is optional. After a real forced skip raises the adaptive target buffer, UEPCB adds a small common delivery delay to smooth stressed play. 1.6.3B keeps the 1 ms per buffer step tuning and a default ceiling of 3 ms. The number shown beside it is Playout Max in milliseconds. Note: the observed hold may exceed this target because delivery occurs on the next USB poll; keep the value small.");
 		help(betaPlayout, playoutHelp);
 		help(betaPlayoutMax, playoutHelp);
-		help(betaRetransmit, tr("UDP Retransmit remains experimental and is not currently recommended for normal stable Wi-Fi. In 1.6.2B it waits until a gap survives 18 ms, sends only one peer-directed NACK, and then extends Sync Hold to at least 60 ms so the requested packet has time to make a real round trip. Enable it together with Sync Hold only when testing unstable or lossy links."));
+		help(betaRetransmit, tr("UDP Retransmit remains experimental and is not currently recommended for normal stable Wi-Fi. It waits until a gap survives 18 ms, sends only one peer-directed NACK, and then extends Sync Hold to at least 60 ms so the requested packet has time to make a real round trip. Enable it together with Sync Hold only when testing unstable or lossy links."));
 		help(betaStallGuard, tr("Global Stall Guard remains an optional diagnostic/protection feature. If different peers forced-skip within 100 ms, that pattern can indicate a local PCSX2/USB scheduling stall rather than independent network loss; the guard prevents several peer buffers from staying enlarged. It has not yet been validated as strongly as Sync Hold, so leave it off for the normal baseline."));
 		helpPair(mac, tr("Leave MAC 12-hex blank so each emulator instance automatically generates a unique Namco MAC. Only enter 12 hexadecimal digits when a fixed MAC is specifically required."));
 
-		// 1.6.2B Save/Clear remain one-shot push-button UI actions. CreateDevice stays read-only.
-		const auto refreshHistoryCombos = [=]() {
-			for (QComboBox* cb : {peer1hist.second, peer2hist.second, peer3hist.second, tcpHist.second})
+		// 1.6.3B: refresh the saved-IP choices without changing the IP currently
+		// typed/selected in each editable combo.
+		const auto refreshIPCombos = [=]() {
+			for (QComboBox* cb : {peer1.second, peer2.second, peer3.second, hostPair.second})
 			{
-				const int old = cb->currentIndex();
+				const QString current = cb->currentText();
+				QLineEdit* edit = cb->lineEdit();
+				const bool old_cb_block = cb->blockSignals(true);
+				const bool old_edit_block = edit ? edit->blockSignals(true) : false;
+				cb->clear();
 				for (int i = 1; i <= 10; i++)
 				{
 					const std::string key = m_config_prefix + fmt::format("History{}", i);
-					const std::string ip = m_dialog->getStringValue(m_config_section.c_str(), key.c_str(), "");
-					cb->setItemText(i, ip.empty() ? tr("Saved IP %1 - (empty)").arg(i) : tr("Saved IP %1 - %2").arg(i).arg(QString::fromStdString(ip)));
+					const QString ip = QString::fromStdString(m_dialog->getStringValue(m_config_section.c_str(), key.c_str(), "")).trimmed();
+					if (!ip.isEmpty() && cb->findText(ip) < 0)
+						cb->addItem(ip);
 				}
-				cb->setCurrentIndex(old);
+				cb->setEditText(current);
+				if (edit)
+					edit->blockSignals(old_edit_block);
+				cb->blockSignals(old_cb_block);
 			}
 		};
 		connect(remember, &QPushButton::clicked, this, [=]() {
 			QStringList candidates;
-			const auto resolved = [&](QLineEdit* manual, QComboBox* combo) {
-				if (combo->currentIndex() >= 1)
-				{
-					const std::string key = m_config_prefix + fmt::format("History{}", combo->currentIndex());
-					const QString saved = QString::fromStdString(m_dialog->getStringValue(m_config_section.c_str(), key.c_str(), ""));
-					if (!saved.trimmed().isEmpty()) return saved.trimmed();
-				}
-				return manual->text().trimmed();
-			};
 			if (mode->currentIndex() == 1 && role->currentIndex() == 1)
-				candidates << resolved(hostPair.second, tcpHist.second);
+				candidates << hostPair.second->currentText().trimmed();
 			else if (mode->currentIndex() == 0)
-				candidates << resolved(peer1.second, peer1hist.second) << resolved(peer2.second, peer2hist.second) << resolved(peer3.second, peer3hist.second);
+				candidates << peer1.second->currentText().trimmed() << peer2.second->currentText().trimmed() << peer3.second->currentText().trimmed();
 			for (int i = 1; i <= 10; i++)
 			{
 				const std::string key = m_config_prefix + fmt::format("History{}", i);
@@ -835,18 +850,23 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 					(m_config_prefix + fmt::format("History{}", i)).c_str(),
 					value.c_str());
 			}
-			refreshHistoryCombos();
+			refreshIPCombos();
 		});
 		connect(clear, &QPushButton::clicked, this, [=]() {
 			for (int i = 1; i <= 10; i++)
 				m_dialog->setStringValue(m_config_section.c_str(), (m_config_prefix + fmt::format("History{}", i)).c_str(), "");
+
+			// The user explicitly prefers Clear to remove the active IP entries too.
+			for (const char* key : {"Peer1IP", "Peer2IP", "Peer3IP", "TCPHostIP"})
+				m_dialog->setStringValue(m_config_section.c_str(), (m_config_prefix + key).c_str(), "");
 			for (const char* key : {"Peer1HistorySlot", "Peer2HistorySlot", "Peer3HistorySlot", "TCPHostHistorySlot"})
 				m_dialog->setIntValue(m_config_section.c_str(), (m_config_prefix + key).c_str(), 0);
-			peer1hist.second->setCurrentIndex(0);
-			peer2hist.second->setCurrentIndex(0);
-			peer3hist.second->setCurrentIndex(0);
-			tcpHist.second->setCurrentIndex(0);
-			refreshHistoryCombos();
+
+			peer1.second->setEditText(QString());
+			peer2.second->setEditText(QString());
+			peer3.second->setEditText(QString());
+			hostPair.second->setEditText(QString());
+			refreshIPCombos();
 		});
 
 		const auto setPairEnabled = [](auto pair, bool enabled) { pair.first->setEnabled(enabled); pair.second->setEnabled(enabled); };
@@ -855,13 +875,13 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			const bool isHost = (role->currentIndex() == 0);
 			const bool adv = advanced->isChecked();
 
-			setPairEnabled(peer1, !isTcp); setPairEnabled(peer1hist, !isTcp);
-			setPairEnabled(peer2, !isTcp); setPairEnabled(peer2hist, !isTcp);
-			setPairEnabled(peer3, !isTcp); setPairEnabled(peer3hist, !isTcp);
+			portPair.first->setText(isTcp ? tr("TCP Port") : tr("Local UDP Port"));
+			setPairEnabled(peer1, !isTcp); setPairEnabled(peer1port, !isTcp);
+			setPairEnabled(peer2, !isTcp); setPairEnabled(peer2port, !isTcp);
+			setPairEnabled(peer3, !isTcp); setPairEnabled(peer3port, !isTcp);
 			roleLabel->setEnabled(isTcp); role->setEnabled(isTcp);
 			setPairEnabled(bindPair, isTcp && isHost);
 			setPairEnabled(hostPair, isTcp && !isHost);
-			setPairEnabled(tcpHist, isTcp && !isHost);
 
 			const bool jitterEnabled = !isTcp && adv;
 			setPairEnabled(grace, jitterEnabled);

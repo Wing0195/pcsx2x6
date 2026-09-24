@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.6.2B (Beta Sync Priority)
+// usb-uepcb1.6.3B (Beta Multi-Instance Routing)
 // Based on: Claude UePcb 1.3
 //
 // 1.5 changes:
@@ -102,7 +102,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.6.2B (TCP/UDP Beta)", ""};
+		"", "Namco", "UE PCB v1.6.3B (TCP/UDP Beta)", ""};
 
 	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
 	// frame. This is purely an emulator-side addition (real UE PCB hardware
@@ -142,6 +142,10 @@ namespace usb_uepcb
 		int udp_port = 7500;
 		std::string broadcast_ip;
 		std::array<std::string, 3> peer_ips{};
+		// 1.6.3B: every UDP peer is a full endpoint (IP + port). This lets
+		// multiple PCSX2 instances share one host IP without fighting over
+		// the same destination port.
+		std::array<int, 3> peer_ports{{7500, 7500, 7500}};
 		u8 mii_phyaddr = 1;
 		u8 mii_reg = 1;
 		bool init_done = false;
@@ -1116,14 +1120,14 @@ namespace usb_uepcb
 		return false;
 	}
 
-	static void udp_send_to(UePcbState* s, const std::string& ip, const u8* wire, int wire_len)
+	static void udp_send_to(UePcbState* s, const std::string& ip, int port, const u8* wire, int wire_len)
 	{
-		if (s->udp_sock == UEPCB_INVALID_SOCKET || ip.empty())
+		if (s->udp_sock == UEPCB_INVALID_SOCKET || ip.empty() || port <= 0 || port > 65535)
 			return;
 
 		sockaddr_in dst{};
 		dst.sin_family = AF_INET;
-		dst.sin_port = htons(static_cast<u16>(s->udp_port));
+		dst.sin_port = htons(static_cast<u16>(port));
 
 		if (inet_pton(AF_INET, ip.c_str(), &dst.sin_addr) != 1)
 			return;
@@ -1136,11 +1140,16 @@ namespace usb_uepcb
 	{
 		if (has_direct_peers(s))
 		{
-			for (const std::string& ip : s->peer_ips)
-				udp_send_to(s, ip, wire, wire_len);
+			for (size_t i = 0; i < s->peer_ips.size(); ++i)
+			{
+				if (!s->peer_ips[i].empty())
+					udp_send_to(s, s->peer_ips[i], s->peer_ports[i], wire, wire_len);
+			}
 			return;
 		}
-		udp_send_to(s, s->broadcast_ip, wire, wire_len);
+		// Broadcast remains a single-port convenience mode. Multi-instance
+		// routing should use Direct Peer endpoints with explicit per-peer ports.
+		udp_send_to(s, s->broadcast_ip, s->udp_port, wire, wire_len);
 	}
 
 	static void peer_key_to_mac(u64 key, u8* mac)
@@ -1531,28 +1540,18 @@ namespace usb_uepcb
 		s->beta_playout_max = std::chrono::milliseconds(playout_max_ms);
 		s->beta_global_stall_guard = USB::GetConfigBool(si, port, "UePcb", "BetaGlobalStallGuard", false);
 
-		static constexpr int kHistorySlots = 10;
-		std::array<std::string, kHistorySlots> history{};
-		for (int i = 0; i < kHistorySlots; ++i)
-		{
-			const std::string key = "History" + std::to_string(i + 1);
-			history[i] = USB::GetConfigString(si, port, "UePcb", key.c_str(), "");
-		}
-
-		const int tcp_history_slot = USB::GetConfigInt(si, port, "UePcb", "TCPHostHistorySlot", 0);
-		if (tcp_history_slot >= 1 && tcp_history_slot <= kHistorySlots && !history[tcp_history_slot - 1].empty())
-			s->tcp_host_ip = history[tcp_history_slot - 1];
-
+		// 1.6.3B has a single source of truth for each endpoint: the IP text
+		// stored in Peer1IP..Peer3IP (or TCPHostIP) plus its explicit peer port.
+		// Saved history is now only a UI convenience and never silently overrides
+		// a typed address in the transport backend.
 		for (int i = 0; i < 3; ++i)
 		{
 			const std::string ip_key = "Peer" + std::to_string(i + 1) + "IP";
+			const std::string port_key = "Peer" + std::to_string(i + 1) + "Port";
 			s->peer_ips[i] = USB::GetConfigString(si, port, "UePcb", ip_key.c_str(), "");
-			const std::string slot_key = "Peer" + std::to_string(i + 1) + "HistorySlot";
-			const int slot = USB::GetConfigInt(si, port, "UePcb", slot_key.c_str(), 0);
-			if (slot >= 1 && slot <= kHistorySlots && !history[slot - 1].empty())
-				s->peer_ips[i] = history[slot - 1];
+			s->peer_ports[i] = std::clamp(
+				USB::GetConfigInt(si, port, "UePcb", port_key.c_str(), 7500), 1, 65535);
 		}
-
 		const std::string mh = USB::GetConfigString(si, port, "UePcb", "MacHex", "");
 		u8 new_mac[6] = {};
 		if (parse_mac_hex(mh, new_mac))
@@ -1570,7 +1569,7 @@ namespace usb_uepcb
 		}
 		std::memcpy(s->an986_regs + 0x10, s->mac, 6);
 
-		Console.WriteLn("UePcb 1.6.2B settings: mode=%s port=%d Hold=%s(%dms) Retransmit=%s Playout=%s(max %dms) StallGuard=%s",
+		Console.WriteLn("UePcb 1.6.3B settings: mode=%s port=%d Hold=%s(%dms) Retransmit=%s Playout=%s(max %dms) StallGuard=%s",
 			s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
 			s->beta_sync_hold ? "ON" : "OFF", sync_hold_ms,
 			s->beta_udp_retransmit ? "ON" : "OFF",
@@ -1760,7 +1759,7 @@ namespace usb_uepcb
 	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		Console.WriteLn("UePcb 1.6.2B: applying settings live (transport restart only; game stays running)");
+		Console.WriteLn("UePcb 1.6.3B: applying settings live (transport restart only; game stays running)");
 
 		// Stop socket/thread activity before changing strings, ports or mode.
 		// tx_seq deliberately survives so remote peers do not see our UDP
@@ -1769,12 +1768,12 @@ namespace usb_uepcb
 		clear_transport_queues(s);
 		load_runtime_settings(s, si, s->config_port, false);
 		if (!start_transport(s))
-			Console.Error("UePcb 1.6.2B: live Apply completed, but transport restart failed");
+			Console.Error("UePcb 1.6.3B: live Apply completed, but transport restart failed");
 		else
-			Console.WriteLn("UePcb 1.6.2B: live Apply complete");
+			Console.WriteLn("UePcb 1.6.3B: live Apply complete");
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6.2B"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6.3B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1795,18 +1794,22 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::IntegerList, .name = "ConnectionMode", .display_name = "Connection Mode",
 				.description = "UDP is the low-latency Direct Peer/Broadcast mode. TCP uses a Host/Client hub.",
 				.default_value = "0", .min_value = "0", .options = connection_modes},
-			{.type = SettingInfo::Type::Integer, .name = "Port", .display_name = "Network Port",
-				.description = "UDP or TCP port used by every player. Default: 7500.",
+			{.type = SettingInfo::Type::Integer, .name = "Port", .display_name = "Local UDP / TCP Port",
+				.description = "UDP: this emulator instance's local receive port. TCP: the Host/Client connection port. Default: 7500. Same-PC UDP multi-instance play requires a unique local port per instance (for example 7500, 7501, 7502, 7503).",
 				.default_value = "7500", .min_value = "1", .max_value = "65535", .step_value = "1"},
 
 			{.type = SettingInfo::Type::String, .name = "TargetIP", .display_name = "Broadcast Address",
 				.description = "UDP only. Used when all Direct Peer IPs are empty. Default: 255.255.255.255.", .default_value = "255.255.255.255"},
-			{.type = SettingInfo::Type::String, .name = "Peer1IP", .display_name = "Direct Peer 1 IP", .description = "UDP manual peer address.", .default_value = ""},
-			{.type = SettingInfo::Type::Integer, .name = "Peer1HistorySlot", .display_name = "Peer 1 Saved IP", .description = "0=Manual, 1-10=saved.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
-			{.type = SettingInfo::Type::String, .name = "Peer2IP", .display_name = "Direct Peer 2 IP", .description = "UDP manual peer address.", .default_value = ""},
-			{.type = SettingInfo::Type::Integer, .name = "Peer2HistorySlot", .display_name = "Peer 2 Saved IP", .description = "0=Manual, 1-10=saved.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
-			{.type = SettingInfo::Type::String, .name = "Peer3IP", .display_name = "Direct Peer 3 IP", .description = "UDP manual peer address.", .default_value = ""},
-			{.type = SettingInfo::Type::Integer, .name = "Peer3HistorySlot", .display_name = "Peer 3 Saved IP", .description = "0=Manual, 1-10=saved.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::String, .name = "Peer1IP", .display_name = "Direct Peer 1 IP", .description = "UDP peer IPv4 address. The custom UI also offers the shared saved-IP history in this editable field.", .default_value = ""},
+			{.type = SettingInfo::Type::Integer, .name = "Peer1Port", .display_name = "Peer 1 Port", .description = "UDP destination port for Peer 1. Default: 7500.", .default_value = "7500", .min_value = "1", .max_value = "65535", .step_value = "1"},
+			{.type = SettingInfo::Type::String, .name = "Peer2IP", .display_name = "Direct Peer 2 IP", .description = "UDP peer IPv4 address. The custom UI also offers the shared saved-IP history in this editable field.", .default_value = ""},
+			{.type = SettingInfo::Type::Integer, .name = "Peer2Port", .display_name = "Peer 2 Port", .description = "UDP destination port for Peer 2. Default: 7500.", .default_value = "7500", .min_value = "1", .max_value = "65535", .step_value = "1"},
+			{.type = SettingInfo::Type::String, .name = "Peer3IP", .display_name = "Direct Peer 3 IP", .description = "UDP peer IPv4 address. The custom UI also offers the shared saved-IP history in this editable field.", .default_value = ""},
+			{.type = SettingInfo::Type::Integer, .name = "Peer3Port", .display_name = "Peer 3 Port", .description = "UDP destination port for Peer 3. Default: 7500.", .default_value = "7500", .min_value = "1", .max_value = "65535", .step_value = "1"},
+			// Legacy 1.5/1.6 saved-IP selector keys retained for migration only.
+			{.type = SettingInfo::Type::Integer, .name = "Peer1HistorySlot", .display_name = "Legacy Peer 1 Saved IP", .description = "Legacy migration key.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "Peer2HistorySlot", .display_name = "Legacy Peer 2 Saved IP", .description = "Legacy migration key.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "Peer3HistorySlot", .display_name = "Legacy Peer 3 Saved IP", .description = "Legacy migration key.", .default_value = "0", .min_value = "0", .max_value = "10", .step_value = "1"},
 
 			{.type = SettingInfo::Type::IntegerList, .name = "TCPRole", .display_name = "TCP Role",
 				.description = "Host listens and relays frames to all Clients. Client connects to the Host.", .default_value = "0", .min_value = "0", .options = tcp_roles},
@@ -1841,7 +1844,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 4.", .default_value = "4", .min_value = "1", .max_value = "8", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMaxPackets", .display_name = "Maximum Jitter Queue", .description = "UDP only. Default 8; keep small to avoid latency buildup.", .default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
 
-			// 1.6.2B Sync Priority beta switches. Sync Hold is recommended; other switches remain optional for A/B testing.
+			// 1.6.3B Sync Priority beta switches. Sync Hold is recommended; other switches remain optional for A/B testing.
 			{.type = SettingInfo::Type::Boolean, .name = "BetaSyncHold", .display_name = "Sync Hold",
 				.description = "UDP beta. Recommended ON. Holds a missing sequence for a bounded time before forced skip, prioritizing synchronization over speed. Test results show 30 ms recovers almost all normal Wi-Fi reordering with very few forced skips.", .default_value = "false"},
 			{.type = SettingInfo::Type::Integer, .name = "BetaSyncHoldMs", .display_name = "Sync Hold Time",
@@ -1849,7 +1852,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::Boolean, .name = "BetaUdpRetransmit", .display_name = "UDP Retransmit",
 				.description = "UDP beta. Experimental; normally leave OFF unless testing unstable links. After a gap survives 18 ms, sends one NACK only to the actual sender and extends Sync Hold to at least 60 ms so the retransmission has time to return.", .default_value = "false"},
 			{.type = SettingInfo::Type::Boolean, .name = "BetaAdaptivePlayout", .display_name = "Adaptive Playout",
-				.description = "UDP beta. Optional. After real forced skips, adds a small common playout delay that decays with the target buffers. The 1.6.2B tuning uses 1 ms per buffer step; 3 ms is the recommended test ceiling.", .default_value = "false"},
+				.description = "UDP beta. Optional. After real forced skips, adds a small common playout delay that decays with the target buffers. The 1.6.3B tuning uses 1 ms per buffer step; 3 ms is the recommended test ceiling.", .default_value = "false"},
 			{.type = SettingInfo::Type::Integer, .name = "BetaPlayoutMaxMs", .display_name = "Playout Maximum",
 				.description = "Maximum target playout delay. Default: 3 ms. Actual observed hold can be longer because delivery occurs on the next USB poll; keep this value small.", .default_value = "3", .min_value = "0", .max_value = "20", .step_value = "1"},
 			{.type = SettingInfo::Type::Boolean, .name = "BetaGlobalStallGuard", .display_name = "Global Stall Guard",
