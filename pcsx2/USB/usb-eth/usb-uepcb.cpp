@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb1.6.3B (Beta Multi-Instance Routing)
+// usb-uepcb1.6.4B (Beta Fast Attack / Smooth Recovery)
 // Based on: Claude UePcb 1.3
 //
 // 1.5 changes:
@@ -102,7 +102,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.6.3B (TCP/UDP Beta)", ""};
+		"", "Namco", "UE PCB v1.6.4B (TCP/UDP Beta)", ""};
 
 	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
 	// frame. This is purely an emulator-side addition (real UE PCB hardware
@@ -142,7 +142,7 @@ namespace usb_uepcb
 		int udp_port = 7500;
 		std::string broadcast_ip;
 		std::array<std::string, 3> peer_ips{};
-		// 1.6.3B: every UDP peer is a full endpoint (IP + port). This lets
+		// 1.6.4B: every UDP peer is a full endpoint (IP + port). This lets
 		// multiple PCSX2 instances share one host IP without fighting over
 		// the same destination port.
 		std::array<int, 3> peer_ports{{7500, 7500, 7500}};
@@ -207,6 +207,10 @@ namespace usb_uepcb
 			u64 diag_hold_events = 0;
 			u64 diag_nack_sent = 0;
 			u64 diag_max_gap_ms = 0;
+			// 1.6.4B Fast Attack diagnostics. Count only real target jumps caused
+			// by gap pressure, not ordinary forced-skip fallback increments.
+			u64 diag_fast_attack = 0;
+			u32 diag_peak_target = 1;
 	};
 
 		std::unordered_map<u64, PeerJitter> peer_jitter;
@@ -220,13 +224,15 @@ namespace usb_uepcb
 		u64 diag_last_forced_peer = 0;
 		bool diag_last_forced_valid = false;
 
-		// User-tunable adaptive jitter parameters. Defaults reproduce
-		// the stable 1.5.1 behavior exactly. Values are clamped on load.
+		// User-tunable adaptive jitter parameters. 1.6.4B defaults are tuned
+		// for Fast Attack + Slow/Smooth Recovery: ordinary short jitter is
+		// ignored, real gaps can raise the target quickly, then recovery drops
+		// one level every 250 ms (8 -> 1 in about 1.75 seconds).
 		size_t jitter_max_packets = 8;
 		u32 jitter_min_target = 1;
-		u32 jitter_max_target = 4;
-		std::chrono::milliseconds jitter_grace{3};
-		std::chrono::milliseconds jitter_decay_interval{4000};
+		u32 jitter_max_target = 8;
+		std::chrono::milliseconds jitter_grace{4};
+		std::chrono::milliseconds jitter_decay_interval{250};
 
 		// 1.6.2B Sync Priority beta features. Every feature is independently
 		// switchable so A/B testing can identify what actually helps.
@@ -396,8 +402,8 @@ namespace usb_uepcb
 	}
 
 	// Adaptive jitter parameters are stored per UePcbState in 1.3.3 so they
-	// can be tuned from the USB settings UI without recompiling. Defaults
-	// remain Grace=3ms, Decay=4000ms, MinTarget=1, MaxTarget=4, Queue=8.
+	// can be tuned from the USB settings UI without recompiling. 1.6.4B defaults
+	// are Grace=4ms, Decay=250ms, MinTarget=1, MaxTarget=8, Queue=8.
 
 	static bool seq_before(u32 a, u32 b)
 	{
@@ -417,6 +423,7 @@ namespace usb_uepcb
 		{
 			jb.next_seq = seq;
 			jb.target_packets = s->jitter_min_target;
+			jb.diag_peak_target = s->jitter_min_target;
 			jb.seq_valid = true;
 		}
 
@@ -575,6 +582,54 @@ namespace usb_uepcb
 					if (static_cast<u64>(gap_age.count()) > jb.diag_max_gap_ms)
 						jb.diag_max_gap_ms = static_cast<u64>(gap_age.count());
 
+					// 1.6.4B Fast Attack. Do not wait for a forced skip before the
+					// adaptive target reacts. Once a real gap survives Jitter Grace,
+					// combine gap age with the amount of already-arrived future data.
+					// High RTT by itself never changes the target; only actual missing/
+					// reordered delivery pressure does.
+					if (gap_age >= s->jitter_grace && jb.target_packets < s->jitter_max_target)
+					{
+						u32 age_target = s->jitter_min_target;
+						const long long age_ms = gap_age.count();
+						if (age_ms >= 25)
+							age_target = s->jitter_max_target;
+						else if (age_ms >= 18)
+							age_target = std::min<u32>(s->jitter_max_target, 6);
+						else if (age_ms >= 12)
+							age_target = std::min<u32>(s->jitter_max_target, 5);
+						else if (age_ms >= 8)
+							age_target = std::min<u32>(s->jitter_max_target, 3);
+						else
+							age_target = std::min<u32>(s->jitter_max_target, 2);
+
+						const size_t ahead_depth = jb.packets.size();
+						u32 depth_target = s->jitter_min_target;
+						if (ahead_depth >= 8)
+							depth_target = s->jitter_max_target;
+						else if (ahead_depth >= 4)
+							depth_target = std::min<u32>(s->jitter_max_target, 5);
+						else if (ahead_depth >= 2)
+							depth_target = std::min<u32>(s->jitter_max_target, 3);
+						else if (ahead_depth >= 1)
+							depth_target = std::min<u32>(s->jitter_max_target, 2);
+
+						u32 desired_target = std::max(age_target, depth_target);
+						desired_target = std::clamp(desired_target, s->jitter_min_target, s->jitter_max_target);
+						if (desired_target > jb.target_packets)
+						{
+							jb.target_packets = desired_target;
+							jb.last_target_change = now;
+							jb.last_target_change_valid = true;
+							++jb.diag_fast_attack;
+							if (jb.target_packets > jb.diag_peak_target)
+								jb.diag_peak_target = jb.target_packets;
+							Console.WriteLn(
+								"UePcb 1.6.4B Fast Attack: target buffer -> %u (peer key %llu, gap=%lldms, ahead=%zu)",
+								jb.target_packets, static_cast<unsigned long long>(entry.first),
+								static_cast<long long>(age_ms), ahead_depth);
+						}
+					}
+
 					std::chrono::milliseconds hold_limit = s->beta_sync_hold_time;
 					if (hold_limit < s->jitter_grace)
 						hold_limit = s->jitter_grace;
@@ -715,8 +770,10 @@ namespace usb_uepcb
 				else if (jb.target_packets < s->jitter_max_target)
 				{
 					++jb.target_packets;
+					if (jb.target_packets > jb.diag_peak_target)
+						jb.diag_peak_target = jb.target_packets;
 					Console.WriteLn(
-						"UePcb: target buffer -> %u (peer key %llu) - forced skip of a missing packet",
+						"UePcb: target buffer -> %u (peer key %llu) - forced-skip fallback growth",
 						jb.target_packets, static_cast<unsigned long long>(selected_peer));
 				}
 
@@ -1520,10 +1577,10 @@ namespace usb_uepcb
 		s->tcp_bind_ip = USB::GetConfigString(si, port, "UePcb", "TCPBindIP", "0.0.0.0");
 		s->tcp_host_ip = USB::GetConfigString(si, port, "UePcb", "TCPHostIP", "127.0.0.1");
 
-		const int grace_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterGraceMs", 3), 0, 20) : 3;
-		const int decay_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterDecayMs", 4000), 250, 60000) : 4000;
+		const int grace_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterGraceMs", 4), 0, 20) : 4;
+		const int decay_ms = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterDecayMs", 250), 250, 60000) : 250;
 		const int min_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterMinTarget", 1), 1, 8) : 1;
-		const int max_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterMaxTarget", 4), min_target, 8) : 4;
+		const int max_target = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterMaxTarget", 8), min_target, 8) : 8;
 		const int max_packets = s->advanced_settings ? std::clamp(USB::GetConfigInt(si, port, "UePcb", "JitterMaxPackets", 8), max_target, 32) : 8;
 		s->jitter_grace = std::chrono::milliseconds(grace_ms);
 		s->jitter_decay_interval = std::chrono::milliseconds(decay_ms);
@@ -1531,7 +1588,7 @@ namespace usb_uepcb
 		s->jitter_max_target = static_cast<u32>(max_target);
 		s->jitter_max_packets = static_cast<size_t>(max_packets);
 
-		s->beta_sync_hold = USB::GetConfigBool(si, port, "UePcb", "BetaSyncHold", false);
+		s->beta_sync_hold = USB::GetConfigBool(si, port, "UePcb", "BetaSyncHold", true);
 		const int sync_hold_ms = std::clamp(USB::GetConfigInt(si, port, "UePcb", "BetaSyncHoldMs", 30), 3, 100);
 		s->beta_sync_hold_time = std::chrono::milliseconds(sync_hold_ms);
 		s->beta_udp_retransmit = USB::GetConfigBool(si, port, "UePcb", "BetaUdpRetransmit", false);
@@ -1540,7 +1597,7 @@ namespace usb_uepcb
 		s->beta_playout_max = std::chrono::milliseconds(playout_max_ms);
 		s->beta_global_stall_guard = USB::GetConfigBool(si, port, "UePcb", "BetaGlobalStallGuard", false);
 
-		// 1.6.3B has a single source of truth for each endpoint: the IP text
+		// 1.6.4B keeps a single source of truth for each endpoint: the IP text
 		// stored in Peer1IP..Peer3IP (or TCPHostIP) plus its explicit peer port.
 		// Saved history is now only a UI convenience and never silently overrides
 		// a typed address in the transport backend.
@@ -1569,8 +1626,9 @@ namespace usb_uepcb
 		}
 		std::memcpy(s->an986_regs + 0x10, s->mac, 6);
 
-		Console.WriteLn("UePcb 1.6.3B settings: mode=%s port=%d Hold=%s(%dms) Retransmit=%s Playout=%s(max %dms) StallGuard=%s",
+		Console.WriteLn("UePcb 1.6.4B settings: mode=%s port=%d Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Retransmit=%s Playout=%s(max %dms) StallGuard=%s",
 			s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
+			grace_ms, decay_ms, min_target, max_target, max_packets,
 			s->beta_sync_hold ? "ON" : "OFF", sync_hold_ms,
 			s->beta_udp_retransmit ? "ON" : "OFF",
 			s->beta_adaptive_playout ? "ON" : "OFF", playout_max_ms,
@@ -1697,7 +1755,7 @@ namespace usb_uepcb
 			{
 				const auto& jb = entry.second;
 				Console.WriteLn(
-					"UePcb DIAG summary peer=%llu RX=%llu Ahead=%llu Recovered=%llu ForcedSkip=%llu Late=%llu Duplicate=%llu MaxAhead=%u Hold=%llu NackSent=%llu MaxGapMs=%llu FinalBuffer=%u Queue=%zu",
+					"UePcb DIAG summary peer=%llu RX=%llu Ahead=%llu Recovered=%llu ForcedSkip=%llu Late=%llu Duplicate=%llu MaxAhead=%u Hold=%llu NackSent=%llu MaxGapMs=%llu FastAttack=%llu PeakTarget=%u FinalBuffer=%u Queue=%zu",
 					static_cast<unsigned long long>(entry.first),
 					static_cast<unsigned long long>(jb.diag_rx),
 					static_cast<unsigned long long>(jb.diag_ahead),
@@ -1709,7 +1767,8 @@ namespace usb_uepcb
 					static_cast<unsigned long long>(jb.diag_hold_events),
 					static_cast<unsigned long long>(jb.diag_nack_sent),
 					static_cast<unsigned long long>(jb.diag_max_gap_ms),
-					jb.target_packets, jb.packets.size());
+					static_cast<unsigned long long>(jb.diag_fast_attack),
+					jb.diag_peak_target, jb.target_packets, jb.packets.size());
 			}
 			Console.WriteLn("UePcb BETA summary NackRX=%llu RetransmitTX=%llu PlayoutEvents=%llu PlayoutHoldTotalMs=%llu PlayoutHoldMaxMs=%llu",
 				static_cast<unsigned long long>(s->diag_nack_rx),
@@ -1759,7 +1818,7 @@ namespace usb_uepcb
 	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		Console.WriteLn("UePcb 1.6.3B: applying settings live (transport restart only; game stays running)");
+		Console.WriteLn("UePcb 1.6.4B: applying settings live (transport restart only; game stays running)");
 
 		// Stop socket/thread activity before changing strings, ports or mode.
 		// tx_seq deliberately survives so remote peers do not see our UDP
@@ -1768,12 +1827,12 @@ namespace usb_uepcb
 		clear_transport_queues(s);
 		load_runtime_settings(s, si, s->config_port, false);
 		if (!start_transport(s))
-			Console.Error("UePcb 1.6.3B: live Apply completed, but transport restart failed");
+			Console.Error("UePcb 1.6.4B: live Apply completed, but transport restart failed");
 		else
-			Console.WriteLn("UePcb 1.6.3B: live Apply complete");
+			Console.WriteLn("UePcb 1.6.4B: live Apply complete");
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6.3B"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6.4B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1837,22 +1896,22 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::String, .name = "History10", .display_name = "Saved IP 10", .description = "Hidden history storage.", .default_value = ""},
 
 			{.type = SettingInfo::Type::Boolean, .name = "AdvancedSettings", .display_name = "Advanced Settings",
-				.description = "Enable manual UDP jitter tuning. When disabled, the proven defaults are forced: Grace 3, Decay 4000, Min 1, Max 4, Queue 8.", .default_value = "false"},
-			{.type = SettingInfo::Type::Integer, .name = "JitterGraceMs", .display_name = "Jitter Grace (ms)", .description = "UDP only. Missing-sequence grace before forced skip.", .default_value = "3", .min_value = "0", .max_value = "20", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer, .name = "JitterDecayMs", .display_name = "Buffer Decay (ms)", .description = "UDP only. Stable time before target buffer relaxes by one.", .default_value = "4000", .min_value = "250", .max_value = "60000", .step_value = "250"},
+				.description = "Enable manual UDP jitter tuning. When disabled, 1.6.4B Fast Attack defaults are forced: Grace 4, Decay 250, Min 1, Max 8, Queue 8.", .default_value = "false"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterGraceMs", .display_name = "Jitter Grace (ms)", .description = "UDP only. Normal short reorder is ignored inside this grace window; after it, Fast Attack may raise the target before forced skip.", .default_value = "4", .min_value = "0", .max_value = "20", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterDecayMs", .display_name = "Buffer Decay (ms)", .description = "UDP only. Stable time before target buffer relaxes by one. 250 ms gives roughly 1.75 s for 8 -> 1.", .default_value = "250", .min_value = "250", .max_value = "60000", .step_value = "250"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMinTarget", .display_name = "Minimum Target Buffer", .description = "UDP only. Default 1.", .default_value = "1", .min_value = "1", .max_value = "8", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 4.", .default_value = "4", .min_value = "1", .max_value = "8", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 8 for 1.6.4B Fast Attack.", .default_value = "8", .min_value = "1", .max_value = "8", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMaxPackets", .display_name = "Maximum Jitter Queue", .description = "UDP only. Default 8; keep small to avoid latency buildup.", .default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
 
-			// 1.6.3B Sync Priority beta switches. Sync Hold is recommended; other switches remain optional for A/B testing.
+			// 1.6.4B Sync Priority beta switches. Sync Hold is the recommended default; other switches remain optional for A/B testing.
 			{.type = SettingInfo::Type::Boolean, .name = "BetaSyncHold", .display_name = "Sync Hold",
-				.description = "UDP beta. Recommended ON. Holds a missing sequence for a bounded time before forced skip, prioritizing synchronization over speed. Test results show 30 ms recovers almost all normal Wi-Fi reordering with very few forced skips.", .default_value = "false"},
+				.description = "UDP beta. Recommended ON. Holds a missing sequence for a bounded time before forced skip, prioritizing synchronization over speed. 1.6.4B pairs the 30 ms hold with Fast Attack target growth.", .default_value = "true"},
 			{.type = SettingInfo::Type::Integer, .name = "BetaSyncHoldMs", .display_name = "Sync Hold Time",
 				.description = "Maximum missing-packet hold when Sync Hold is enabled. Default and recommended starting point: 30 ms.", .default_value = "30", .min_value = "3", .max_value = "100", .step_value = "1"},
 			{.type = SettingInfo::Type::Boolean, .name = "BetaUdpRetransmit", .display_name = "UDP Retransmit",
 				.description = "UDP beta. Experimental; normally leave OFF unless testing unstable links. After a gap survives 18 ms, sends one NACK only to the actual sender and extends Sync Hold to at least 60 ms so the retransmission has time to return.", .default_value = "false"},
 			{.type = SettingInfo::Type::Boolean, .name = "BetaAdaptivePlayout", .display_name = "Adaptive Playout",
-				.description = "UDP beta. Optional. After real forced skips, adds a small common playout delay that decays with the target buffers. The 1.6.3B tuning uses 1 ms per buffer step; 3 ms is the recommended test ceiling.", .default_value = "false"},
+				.description = "UDP beta. Optional. When Fast Attack or forced-skip fallback raises the adaptive target, adds a small common playout delay that decays with the target buffers. The 1.6.4B tuning uses 1 ms per buffer step; 3 ms remains the recommended test ceiling.", .default_value = "false"},
 			{.type = SettingInfo::Type::Integer, .name = "BetaPlayoutMaxMs", .display_name = "Playout Maximum",
 				.description = "Maximum target playout delay. Default: 3 ms. Actual observed hold can be longer because delivery occurs on the next USB poll; keep this value small.", .default_value = "3", .min_value = "0", .max_value = "20", .step_value = "1"},
 			{.type = SettingInfo::Type::Boolean, .name = "BetaGlobalStallGuard", .display_name = "Global Stall Guard",

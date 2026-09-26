@@ -620,7 +620,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-	// UE PCB 1.6.3B compact TCP/UDP + multi-instance endpoint layout. Detailed help is shown in one
+	// UE PCB 1.6.4B compact TCP/UDP + multi-instance endpoint layout. Detailed help is shown in one
 	// fixed description area at the bottom when the pointer enters a setting.
 	if (m_config_prefix == "UePcb_")
 	{
@@ -672,7 +672,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		layout->addWidget(modeLabel, current_row, 0); layout->addWidget(mode, current_row, 1);
 		auto portPair = addInt("Port", tr("Local UDP Port"), 7500, 1, 65535, 1, current_row, 2); current_row++;
 
-		// 1.6.3B: editable IP history and an explicit destination port form one
+		// 1.6.4B: editable IP history and an explicit destination port form one
 		// complete UDP endpoint. Saved IPs are now selected directly inside the
 		// IP field, removing the old Manual-vs-Saved ambiguity.
 		auto peer1 = addEditableIPCombo("Peer1IP", tr("Direct Peer 1 IP"), "", current_row, 0);
@@ -703,20 +703,20 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		advanced->setObjectName(QStringLiteral("AdvancedSettings"));
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(sif, advanced, m_config_section, m_config_prefix + "AdvancedSettings", false);
 		layout->addWidget(advanced, current_row++, 0, 1, 4);
-		auto grace = addInt("JitterGraceMs", tr("Jitter Grace (ms)"), 3, 0, 20, 1, current_row, 0);
-		auto decay = addInt("JitterDecayMs", tr("Buffer Decay (ms)"), 4000, 250, 60000, 250, current_row, 2); current_row++;
+		auto grace = addInt("JitterGraceMs", tr("Jitter Grace (ms)"), 4, 0, 20, 1, current_row, 0);
+		auto decay = addInt("JitterDecayMs", tr("Buffer Decay (ms)"), 250, 250, 60000, 250, current_row, 2); current_row++;
 		auto minTarget = addInt("JitterMinTarget", tr("Minimum Target Buffer"), 1, 1, 8, 1, current_row, 0);
-		auto maxTarget = addInt("JitterMaxTarget", tr("Maximum Target Buffer"), 4, 1, 8, 1, current_row, 2); current_row++;
+		auto maxTarget = addInt("JitterMaxTarget", tr("Maximum Target Buffer"), 8, 1, 8, 1, current_row, 2); current_row++;
 		auto maxQueue = addInt("JitterMaxPackets", tr("Maximum Jitter Queue"), 8, 1, 32, 1, current_row, 0);
 		auto broadcast = addString("TargetIP", tr("Broadcast Address"), "255.255.255.255", current_row, 2); current_row++;
 
-		// 1.6.3B Sync Priority controls. Sync Hold is the recommended baseline;
+		// 1.6.4B Sync Priority controls. Sync Hold is the recommended baseline;
 		// the remaining switches stay independent for A/B testing.
 		// Keep both primary timing controls on one compact row. The units live
 		// inside the spin boxes; detailed meanings are in the hover Description.
 		QCheckBox* betaSyncHold = new QCheckBox(tr("Sync Hold"), widget_parent);
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
-			sif, betaSyncHold, m_config_section, m_config_prefix + "BetaSyncHold", false);
+			sif, betaSyncHold, m_config_section, m_config_prefix + "BetaSyncHold", true);
 		QSpinBox* betaHoldMs = new QSpinBox(widget_parent);
 		betaHoldMs->setObjectName(QStringLiteral("BetaSyncHoldMs"));
 		betaHoldMs->setRange(3, 100);
@@ -787,24 +787,24 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		const QString rememberHelp = tr("Save Current IPs stores the current Peer 1-3 IP fields, or the TCP Client Host IP, into the shared 10-entry history immediately. Recent addresses move to the front and duplicates are removed. Ports are not stored in IP history.");
 		help(remember, rememberHelp);
 		help(clear, tr("Clear Saved IPs erases all ten saved addresses and also clears the current UDP Peer IP and TCP Host IP fields. Peer port values are left unchanged."));
-		help(advanced, tr("Leave Advanced Settings unchecked for the proven UDP defaults: Jitter Grace 3 ms, Buffer Decay 4000 ms, Minimum Target 1, Maximum Target 4 and Queue 8. Enable it to unlock manual UDP jitter tuning and Broadcast Address. TCP bypasses these controls."));
-		helpPair(grace, tr("Jitter Grace is how long a missing UDP sequence may recover before a forced skip. Default: 3 ms."));
-		helpPair(decay, tr("Buffer Decay is the stable playback time before the adaptive target buffer drops by one step. Default: 4000 ms; 8000-12000 ms can be useful smoothness tests."));
+		help(advanced, tr("Leave Advanced Settings unchecked for the 1.6.4B Fast Attack defaults: Jitter Grace 4 ms, Buffer Decay 250 ms, Minimum Target 1, Maximum Target 8 and Queue 8. These values are tuned for fast reaction to real packet disorder and a smooth recovery from Target 8 back to 1 in about 1.75 seconds. Enable Advanced Settings only when manually testing other values. TCP bypasses these controls."));
+		helpPair(grace, tr("Jitter Grace is the quiet window for ordinary short UDP reordering. In 1.6.4B, Fast Attack does not raise the target inside this window. Default: 4 ms. If the gap survives beyond Grace, the target may jump according to gap age and ahead depth before any forced skip occurs."));
+		helpPair(decay, tr("Buffer Decay is the stable playback time before the adaptive target drops by one level. Default: 250 ms. With Maximum Target 8, recovery 8 -> 1 takes about 1.75 seconds, giving the intended slow/smooth recovery after a fast rise."));
 		helpPair(minTarget, tr("Minimum Target Buffer sets the lowest adaptive UDP playback depth. Default: 1."));
-		helpPair(maxTarget, tr("Maximum Target Buffer limits how far the adaptive UDP playback depth can grow. Default: 4."));
-		helpPair(maxQueue, tr("Maximum Jitter Queue is the hard per-peer UDP holding limit. Default: 8. Increasing it too far can accumulate latency."));
+		helpPair(maxTarget, tr("Maximum Target Buffer limits Fast Attack growth. Default: 8. A real gap can jump directly to 2/3/5/6/8 depending on how long the expected packet is missing and how many later packets have already arrived; high ping alone does not raise it."));
+		helpPair(maxQueue, tr("Maximum Jitter Queue is the hard per-peer UDP holding limit. Default: 8, matching the new Maximum Target. Keep it small; larger queues can accumulate unnecessary latency."));
 		helpPair(broadcast, tr("Broadcast Address is used only in UDP when all three Direct Peer IPs are empty. Default: 255.255.255.255. Broadcast uses this instance's Local UDP Port; for reliable same-PC multi-instance routing, use explicit Direct Peer IP + Port endpoints instead."));
-		const QString syncHoldHelp = tr("Sync Hold is the recommended synchronization-first option. When a UDP sequence is missing, UEPCB waits for a bounded time instead of immediately forced-skipping. Three-machine Wi-Fi testing recovered more than 99% of ahead/reordered packets with only two forced skips using 30 ms. Recommended: enable Sync Hold; 30 ms is the current starting value. The number shown beside it is the maximum Sync Hold time in milliseconds.");
+		const QString syncHoldHelp = tr("Sync Hold is the recommended synchronization-first option and is ON by default for new/reset 1.6.4B profiles. When a UDP sequence is missing, UEPCB waits up to 30 ms instead of immediately forced-skipping. Fast Attack can raise the target during that wait, so UEPCB reacts to real jitter/bursts without increasing Hold merely because ping is high.");
 		help(betaSyncHold, syncHoldHelp);
 		help(betaHoldMs, syncHoldHelp);
-		const QString playoutHelp = tr("Adaptive Playout is optional. After a real forced skip raises the adaptive target buffer, UEPCB adds a small common delivery delay to smooth stressed play. 1.6.3B keeps the 1 ms per buffer step tuning and a default ceiling of 3 ms. The number shown beside it is Playout Max in milliseconds. Note: the observed hold may exceed this target because delivery occurs on the next USB poll; keep the value small.");
+		const QString playoutHelp = tr("Adaptive Playout is optional. In 1.6.4B the target can now rise through Fast Attack before a forced skip, so Playout may become active earlier when the target is elevated. It still uses 1 ms per buffer step with a 3 ms ceiling. Keep it OFF for the clean Sync Hold baseline, or enable it only for A/B testing because the observed hold can exceed the target until the next USB poll.");
 		help(betaPlayout, playoutHelp);
 		help(betaPlayoutMax, playoutHelp);
-		help(betaRetransmit, tr("UDP Retransmit remains experimental and is not currently recommended for normal stable Wi-Fi. It waits until a gap survives 18 ms, sends only one peer-directed NACK, and then extends Sync Hold to at least 60 ms so the requested packet has time to make a real round trip. Enable it together with Sync Hold only when testing unstable or lossy links."));
+		help(betaRetransmit, tr("UDP Retransmit remains experimental and is not recommended for normal stable links. It waits until a real gap survives 18 ms, sends one peer-directed NACK, and only that recovery path may extend the wait to about 60 ms. Normal Sync Hold remains 30 ms; 1.6.4B does not use a 120 ms gameplay hold."));
 		help(betaStallGuard, tr("Global Stall Guard remains an optional diagnostic/protection feature. If different peers forced-skip within 100 ms, that pattern can indicate a local PCSX2/USB scheduling stall rather than independent network loss; the guard prevents several peer buffers from staying enlarged. It has not yet been validated as strongly as Sync Hold, so leave it off for the normal baseline."));
 		helpPair(mac, tr("Leave MAC 12-hex blank so each emulator instance automatically generates a unique Namco MAC. Only enter 12 hexadecimal digits when a fixed MAC is specifically required."));
 
-		// 1.6.3B: refresh the saved-IP choices without changing the IP currently
+		// 1.6.4B: refresh the saved-IP choices without changing the IP currently
 		// typed/selected in each editable combo.
 		const auto refreshIPCombos = [=]() {
 			for (QComboBox* cb : {peer1.second, peer2.second, peer3.second, hostPair.second})
