@@ -1375,7 +1375,7 @@ namespace usb_uepcb
 						if (s->tcp_peers.size() < 3)
 						{
 							s->tcp_peers.push_back(conn);
-							TcpPeerMeta meta;
+							UePcbState::TcpPeerMeta meta;
 							meta.remote_addr = remote;
 							s->tcp_peer_meta[conn] = meta;
 							accepted = true;
@@ -1663,7 +1663,7 @@ namespace usb_uepcb
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
 
-		if (iopMem && iopMem->Main)
+		if (iopMem)
 		{
 			static bool s_patched_all = false;
 			if (!s_patched_all)
