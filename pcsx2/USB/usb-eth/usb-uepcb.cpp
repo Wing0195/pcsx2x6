@@ -613,7 +613,7 @@ namespace usb_uepcb
 						else if (ahead_depth >= 1)
 							depth_target = std::min<u32>(s->jitter_max_target, 2);
 
-						u32 desired_target = std::max(age_target, depth_target);
+						u32 desired_target = (age_target > depth_target) ? age_target : depth_target;
 						desired_target = std::clamp(desired_target, s->jitter_min_target, s->jitter_max_target);
 						if (desired_target > jb.target_packets)
 						{
