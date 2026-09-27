@@ -1,9 +1,19 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb 1.6 (Release)
+// usb-uepcb 1.7B (Beta)
 // Created by Wing0195
-// Based on: Claude UePcb 1.3
+// Based on: UE PCB 1.6 release
+//
+// 1.7B beta:
+//   - Adds TCP bootstrap/session discovery with an optional automatic switch to UDP P2P.
+//   - New TCP After Connect mode: Stay TCP or Auto UDP P2P.
+//   - Auto UDP P2P negotiates each instance endpoint over TCP, ACKs a common peer list,
+//     then activates the UDP mesh together. Game traffic stays on TCP until activation.
+//   - Auto UDP ports are allocated per host starting from the TCP session port, allowing
+//     1PC multi-instance play without manually assigning UDP ports.
+//   - Direct Internet NAT hole punching is not implemented; Auto UDP P2P is intended for
+//     same-PC, LAN, or mutually-routable VPN/Tailscale peers.
 //
 // 1.6 release:
 //   - Promotes Fast Attack + Slow/Smooth Recovery and Sync Hold to the stable UDP baseline.
@@ -76,6 +86,7 @@
 #include <map>
 #include <array>
 #include <unordered_map>
+#include <utility>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -110,7 +121,7 @@ namespace usb_uepcb
 		0x07, 0x05, 0x83, 0x03, 0x08, 0x00, 0x0A};
 
 	static const char* uepcb_strings[] = {
-		"", "Namco", "UE PCB v1.6 (TCP/UDP)", ""};
+		"", "Namco", "UE PCB v1.7B (TCP/UDP Auto P2P)", ""};
 
 	// Trailer appended to every UDP wire packet, *after* the raw Ethernet
 	// frame. This is purely an emulator-side addition (real UE PCB hardware
@@ -255,13 +266,37 @@ namespace usb_uepcb
 		int tcp_port = 7500;
 		std::string tcp_host_ip = "127.0.0.1";
 		std::string tcp_bind_ip = "0.0.0.0";
+		// 1.7B: 0 = stay on TCP for game traffic, 1 = use TCP as a bootstrap
+		// session and switch all currently-connected peers to an auto-discovered
+		// UDP P2P mesh after a peer-list/ACK/ACTIVATE handshake.
+		int tcp_data_mode = 1;
 		std::mutex tcp_sock_lock;
 		socket_t tcp_listen_sock = UEPCB_INVALID_SOCKET;
 		socket_t tcp_connect_sock = UEPCB_INVALID_SOCKET;
+
+		struct TcpPeerMeta
+		{
+			sockaddr_in remote_addr{};
+			bool hello_received = false;
+			u16 udp_port = 0;
+			std::array<u8, 6> mac{};
+			u32 ack_generation = 0;
+		};
+
 		std::mutex tcp_peers_lock;
 		std::vector<socket_t> tcp_peers;
+		std::unordered_map<socket_t, TcpPeerMeta> tcp_peer_meta;
+
+		// Auto UDP P2P state. The TCP connection remains alive as the control
+		// channel after activation, while Ethernet frames move to these endpoints.
+		std::mutex auto_udp_lock;
+		std::vector<sockaddr_in> auto_udp_peers;
+		std::atomic<bool> auto_udp_ready{false};
+		u32 auto_session_generation = 0;
+		u32 auto_client_generation = 0;
 
 		std::thread recv_thread;
+		std::thread udp_recv_thread;
 		std::atomic<bool> thread_stop{false};
 	} UePcbState;
 
@@ -791,6 +826,344 @@ namespace usb_uepcb
 		s->in_q.push_back(to_bulkin(eth, len));
 	}
 
+	static constexpr u8 kAutoCtrlMagic[4] = {'U', 'P', '1', '7'};
+	static constexpr u8 kAutoCtrlVersion = 1;
+	enum : u8
+	{
+		AUTO_CTRL_HELLO = 1,
+		AUTO_CTRL_PEER_LIST = 2,
+		AUTO_CTRL_ACK = 3,
+		AUTO_CTRL_ACTIVATE = 4,
+	};
+
+	static bool tcp_send_payload(socket_t c, const u8* data, int len)
+	{
+		if (c == UEPCB_INVALID_SOCKET || !data || len <= 0 || len > 4096)
+			return false;
+		const u8 hdr[4] = {
+			static_cast<u8>((len >> 24) & 0xff), static_cast<u8>((len >> 16) & 0xff),
+			static_cast<u8>((len >> 8) & 0xff), static_cast<u8>(len & 0xff)};
+		return tcp_send_exact(c, hdr, 4) && tcp_send_exact(c, data, len);
+	}
+
+	static bool auto_is_control(const u8* data, int len)
+	{
+		return data && len >= 6 && std::memcmp(data, kAutoCtrlMagic, 4) == 0 && data[5] == kAutoCtrlVersion;
+	}
+
+	static void auto_put_u16(std::vector<u8>& out, u16 v)
+	{
+		out.push_back(static_cast<u8>((v >> 8) & 0xff));
+		out.push_back(static_cast<u8>(v & 0xff));
+	}
+
+	static void auto_put_u32(std::vector<u8>& out, u32 v)
+	{
+		out.push_back(static_cast<u8>((v >> 24) & 0xff));
+		out.push_back(static_cast<u8>((v >> 16) & 0xff));
+		out.push_back(static_cast<u8>((v >> 8) & 0xff));
+		out.push_back(static_cast<u8>(v & 0xff));
+	}
+
+	static u16 auto_get_u16(const u8* p)
+	{
+		return static_cast<u16>((static_cast<u16>(p[0]) << 8) | static_cast<u16>(p[1]));
+	}
+
+	static u32 auto_get_u32(const u8* p)
+	{
+		return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
+			(static_cast<u32>(p[2]) << 8) | static_cast<u32>(p[3]);
+	}
+
+	static void auto_clear_udp_peers(UePcbState* s)
+	{
+		std::lock_guard<std::mutex> lk(s->auto_udp_lock);
+		s->auto_udp_peers.clear();
+	}
+
+	static void auto_set_udp_peers(UePcbState* s, const std::vector<sockaddr_in>& peers)
+	{
+		std::lock_guard<std::mutex> lk(s->auto_udp_lock);
+		s->auto_udp_peers = peers;
+	}
+
+	static bool auto_send_hello(UePcbState* s, socket_t c)
+	{
+		if (s->udp_sock == UEPCB_INVALID_SOCKET || s->udp_port <= 0 || s->udp_port > 65535)
+			return false;
+		std::vector<u8> msg;
+		msg.reserve(14);
+		msg.insert(msg.end(), kAutoCtrlMagic, kAutoCtrlMagic + 4);
+		msg.push_back(AUTO_CTRL_HELLO);
+		msg.push_back(kAutoCtrlVersion);
+		auto_put_u16(msg, static_cast<u16>(s->udp_port));
+		msg.insert(msg.end(), s->mac, s->mac + 6);
+		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+		return tcp_send_payload(c, msg.data(), static_cast<int>(msg.size()));
+	}
+
+	static bool auto_send_ack(UePcbState* s, socket_t c, u32 generation)
+	{
+		std::vector<u8> msg;
+		msg.insert(msg.end(), kAutoCtrlMagic, kAutoCtrlMagic + 4);
+		msg.push_back(AUTO_CTRL_ACK);
+		msg.push_back(kAutoCtrlVersion);
+		auto_put_u32(msg, generation);
+		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+		return tcp_send_payload(c, msg.data(), static_cast<int>(msg.size()));
+	}
+
+	static bool auto_send_activate(UePcbState* s, socket_t c, u32 generation)
+	{
+		std::vector<u8> msg;
+		msg.insert(msg.end(), kAutoCtrlMagic, kAutoCtrlMagic + 4);
+		msg.push_back(AUTO_CTRL_ACTIVATE);
+		msg.push_back(kAutoCtrlVersion);
+		auto_put_u32(msg, generation);
+		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+		return tcp_send_payload(c, msg.data(), static_cast<int>(msg.size()));
+	}
+
+	static void auto_host_rebuild_session(UePcbState* s)
+	{
+		if (!s->tcp_is_host || s->tcp_data_mode != 1 || s->udp_sock == UEPCB_INVALID_SOCKET)
+			return;
+
+		struct ReadyPeer
+		{
+			socket_t sock = UEPCB_INVALID_SOCKET;
+			sockaddr_in remote{};
+			u16 udp_port = 0;
+			std::array<u8, 6> mac{};
+		};
+
+		std::vector<ReadyPeer> ready;
+		u32 generation = 0;
+		{
+			std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+			++s->auto_session_generation;
+			if (s->auto_session_generation == 0)
+				++s->auto_session_generation;
+			generation = s->auto_session_generation;
+			for (socket_t p : s->tcp_peers)
+			{
+				auto it = s->tcp_peer_meta.find(p);
+				if (it == s->tcp_peer_meta.end() || !it->second.hello_received)
+					continue;
+				it->second.ack_generation = 0;
+				ReadyPeer rp;
+				rp.sock = p;
+				rp.remote = it->second.remote_addr;
+				rp.udp_port = it->second.udp_port;
+				rp.mac = it->second.mac;
+				ready.push_back(rp);
+			}
+		}
+
+		s->auto_udp_ready = false;
+		std::vector<sockaddr_in> host_peers;
+		for (const ReadyPeer& rp : ready)
+		{
+			sockaddr_in ep = rp.remote;
+			ep.sin_port = htons(rp.udp_port);
+			host_peers.push_back(ep);
+			char ipbuf[INET_ADDRSTRLEN] = {};
+			if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
+				Console.WriteLn("UePcb 1.7B: discovered Client UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(rp.udp_port));
+		}
+		auto_set_udp_peers(s, host_peers);
+
+		for (const ReadyPeer& recipient : ready)
+		{
+			std::vector<std::pair<sockaddr_in, std::array<u8, 6>>> entries;
+
+			// Advertise the Host endpoint using the local address of this exact
+			// TCP connection. This naturally gives 127.0.0.1 for same-PC clients,
+			// a LAN address for LAN clients, and a Tailscale/VPN address when the
+			// TCP session itself was established over that adapter.
+			sockaddr_in host_ep{};
+#ifdef _WIN32
+			int host_len = sizeof(host_ep);
+#else
+			socklen_t host_len = sizeof(host_ep);
+#endif
+			if (getsockname(recipient.sock, reinterpret_cast<sockaddr*>(&host_ep), &host_len) == 0)
+			{
+				host_ep.sin_port = htons(static_cast<u16>(s->udp_port));
+				std::array<u8, 6> host_mac{};
+				std::memcpy(host_mac.data(), s->mac, 6);
+				entries.emplace_back(host_ep, host_mac);
+			}
+
+			for (const ReadyPeer& other : ready)
+			{
+				if (other.sock == recipient.sock)
+					continue;
+				sockaddr_in ep = other.remote;
+				ep.sin_port = htons(other.udp_port);
+				entries.emplace_back(ep, other.mac);
+				if (entries.size() >= 3)
+					break;
+			}
+
+			std::vector<u8> msg;
+			msg.reserve(12 + entries.size() * 12);
+			msg.insert(msg.end(), kAutoCtrlMagic, kAutoCtrlMagic + 4);
+			msg.push_back(AUTO_CTRL_PEER_LIST);
+			msg.push_back(kAutoCtrlVersion);
+			msg.push_back(static_cast<u8>(entries.size()));
+			msg.push_back(0);
+			auto_put_u32(msg, generation);
+			for (const auto& entry : entries)
+			{
+				const u8* ip = reinterpret_cast<const u8*>(&entry.first.sin_addr.s_addr);
+				msg.insert(msg.end(), ip, ip + 4);
+				auto_put_u16(msg, ntohs(entry.first.sin_port));
+				msg.insert(msg.end(), entry.second.begin(), entry.second.end());
+			}
+			{
+				std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+				tcp_send_payload(recipient.sock, msg.data(), static_cast<int>(msg.size()));
+			}
+		}
+
+		Console.WriteLn("UePcb 1.7B: TCP bootstrap peer list generation %u sent (%d client%s, UDP local %d)",
+			generation, static_cast<int>(ready.size()), ready.size() == 1 ? "" : "s", s->udp_port);
+	}
+
+	static void auto_host_try_activate(UePcbState* s, u32 generation)
+	{
+		std::vector<socket_t> ready_sockets;
+		{
+			std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+			if (generation == 0 || generation != s->auto_session_generation)
+				return;
+			bool have_peer = false;
+			for (socket_t p : s->tcp_peers)
+			{
+				auto it = s->tcp_peer_meta.find(p);
+				// Do not activate a partial UDP mesh. If any connected Client is
+				// running Stay TCP, has no UDP socket, or has not completed HELLO,
+				// the whole session safely remains on TCP.
+				if (it == s->tcp_peer_meta.end() || !it->second.hello_received)
+					return;
+				have_peer = true;
+				if (it->second.ack_generation != generation)
+					return;
+				ready_sockets.push_back(p);
+			}
+			if (!have_peer)
+				return;
+		}
+
+		for (socket_t p : ready_sockets)
+			auto_send_activate(s, p, generation);
+		s->auto_udp_ready = true;
+		Console.WriteLn("UePcb 1.7B: Auto UDP P2P ACTIVE generation %u (%d peer%s)",
+			generation, static_cast<int>(ready_sockets.size()), ready_sockets.size() == 1 ? "" : "s");
+	}
+
+	static void auto_client_handle_peer_list(UePcbState* s, socket_t conn, const u8* data, int len)
+	{
+		if (len < 12)
+			return;
+		const u8 count = data[6];
+		const u32 generation = auto_get_u32(data + 8);
+		if (count > 3 || len != 12 + static_cast<int>(count) * 12)
+			return;
+
+		s->auto_udp_ready = false;
+		s->auto_client_generation = generation;
+		std::vector<sockaddr_in> peers;
+		const u8* p = data + 12;
+		for (u8 i = 0; i < count; ++i, p += 12)
+		{
+			sockaddr_in ep{};
+			ep.sin_family = AF_INET;
+			std::memcpy(&ep.sin_addr.s_addr, p, 4);
+			ep.sin_port = htons(auto_get_u16(p + 4));
+			// The Host already excludes this Client from its own list. Still skip
+			// an accidental same-MAC entry to protect against malformed control data.
+			if (std::memcmp(p + 6, s->mac, 6) != 0)
+			{
+				peers.push_back(ep);
+				char ipbuf[INET_ADDRSTRLEN] = {};
+				if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
+					Console.WriteLn("UePcb 1.7B: peer-list UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(ntohs(ep.sin_port)));
+			}
+		}
+		auto_set_udp_peers(s, peers);
+		auto_send_ack(s, conn, generation);
+		Console.WriteLn("UePcb 1.7B: received Auto UDP peer list generation %u (%d endpoint%s); ACK sent",
+			generation, static_cast<int>(peers.size()), peers.size() == 1 ? "" : "s");
+	}
+
+	static bool auto_handle_client_control(UePcbState* s, socket_t conn, const u8* data, int len)
+	{
+		if (!auto_is_control(data, len))
+			return false;
+		if (s->tcp_data_mode != 1)
+		{
+			Console.Warning("UePcb 1.7B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			return true;
+		}
+		const u8 type = data[4];
+		if (type == AUTO_CTRL_PEER_LIST)
+			auto_client_handle_peer_list(s, conn, data, len);
+		else if (type == AUTO_CTRL_ACTIVATE && len == 10)
+		{
+			const u32 generation = auto_get_u32(data + 6);
+			if (generation == s->auto_client_generation && generation != 0)
+			{
+				s->auto_udp_ready = true;
+				Console.WriteLn("UePcb 1.7B: Auto UDP P2P ACTIVE generation %u", generation);
+			}
+		}
+		return true;
+	}
+
+	static bool auto_handle_host_control(UePcbState* s, socket_t conn, const u8* data, int len)
+	{
+		if (!auto_is_control(data, len))
+			return false;
+		if (s->tcp_data_mode != 1)
+		{
+			Console.Warning("UePcb 1.7B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			return true;
+		}
+
+		const u8 type = data[4];
+		if (type == AUTO_CTRL_HELLO && len == 14)
+		{
+			const u16 udp_port = auto_get_u16(data + 6);
+			if (udp_port == 0)
+				return true;
+			{
+				std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+				auto it = s->tcp_peer_meta.find(conn);
+				if (it == s->tcp_peer_meta.end())
+					return true;
+				it->second.hello_received = true;
+				it->second.udp_port = udp_port;
+				std::copy(data + 8, data + 14, it->second.mac.begin());
+			}
+			auto_host_rebuild_session(s);
+		}
+		else if (type == AUTO_CTRL_ACK && len == 10)
+		{
+			const u32 generation = auto_get_u32(data + 6);
+			{
+				std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+				auto it = s->tcp_peer_meta.find(conn);
+				if (it != s->tcp_peer_meta.end())
+					it->second.ack_generation = generation;
+			}
+			auto_host_try_activate(s, generation);
+		}
+		return true;
+	}
+
 	static void tcp_remove_peer(UePcbState* s, socket_t p)
 	{
 		bool owned = false;
@@ -805,9 +1178,12 @@ namespace usb_uepcb
 					break;
 				}
 			}
+			s->tcp_peer_meta.erase(p);
 		}
 		if (owned)
 			sock_close(p);
+		if (owned && s->tcp_is_host && s->tcp_data_mode == 1 && !s->thread_stop)
+			auto_host_rebuild_session(s);
 	}
 
 	static void tcp_host_flood(UePcbState* s, socket_t src, const u8* eth, int len)
@@ -839,12 +1215,16 @@ namespace usb_uepcb
 				break;
 			const u32 ln = (static_cast<u32>(hdr[0]) << 24) | (static_cast<u32>(hdr[1]) << 16) |
 				(static_cast<u32>(hdr[2]) << 8) | static_cast<u32>(hdr[3]);
+			if (ln == 0 || ln > 4096)
+				break;
+			std::vector<u8> payload(ln);
+			if (!tcp_recv_exact(conn, payload.data(), static_cast<int>(ln)))
+				break;
+			if (auto_handle_client_control(s, conn, payload.data(), static_cast<int>(ln)))
+				continue;
 			if (ln < 14 || ln > 2048)
 				break;
-			std::vector<u8> eth(ln);
-			if (!tcp_recv_exact(conn, eth.data(), static_cast<int>(ln)))
-				break;
-			tcp_push_received_frame(s, eth.data(), static_cast<int>(ln));
+			tcp_push_received_frame(s, payload.data(), static_cast<int>(ln));
 		}
 	}
 
@@ -852,6 +1232,8 @@ namespace usb_uepcb
 	{
 		while (!s->thread_stop)
 		{
+			s->auto_udp_ready = false;
+			auto_clear_udp_peers(s);
 			socket_t conn = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 			if (conn != UEPCB_INVALID_SOCKET)
 			{
@@ -893,6 +1275,11 @@ namespace usb_uepcb
 						s->tcp_peers.assign(1, conn);
 					}
 					Console.WriteLn("UePcb: TCP CLIENT connected %s:%d", s->tcp_host_ip.c_str(), s->tcp_port);
+					if (s->tcp_data_mode == 1 && s->udp_sock != UEPCB_INVALID_SOCKET)
+					{
+						if (auto_send_hello(s, conn))
+							Console.WriteLn("UePcb 1.7B: Auto UDP HELLO sent (local UDP %d)", s->udp_port);
+					}
 					tcp_client_recv_loop(s, conn);
 
 					bool owned = false;
@@ -906,6 +1293,8 @@ namespace usb_uepcb
 					}
 					if (owned)
 						sock_close(conn);
+					s->auto_udp_ready = false;
+					auto_clear_udp_peers(s);
 				}
 				else
 				{
@@ -969,14 +1358,35 @@ namespace usb_uepcb
 
 			if (FD_ISSET(ls, &rf))
 			{
-				socket_t conn = accept(ls, nullptr, nullptr);
+				sockaddr_in remote{};
+#ifdef _WIN32
+				int remote_len = sizeof(remote);
+#else
+				socklen_t remote_len = sizeof(remote);
+#endif
+				socket_t conn = accept(ls, reinterpret_cast<sockaddr*>(&remote), &remote_len);
 				if (conn != UEPCB_INVALID_SOCKET)
 				{
 					int nd = 1;
 					setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
-					std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
-					s->tcp_peers.push_back(conn);
-					Console.WriteLn("UePcb: TCP peer connected (%d total)", static_cast<int>(s->tcp_peers.size()));
+					bool accepted = false;
+					{
+						std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+						if (s->tcp_peers.size() < 3)
+						{
+							s->tcp_peers.push_back(conn);
+							TcpPeerMeta meta;
+							meta.remote_addr = remote;
+							s->tcp_peer_meta[conn] = meta;
+							accepted = true;
+							Console.WriteLn("UePcb: TCP peer connected (%d total)", static_cast<int>(s->tcp_peers.size()));
+						}
+					}
+					if (!accepted)
+					{
+						Console.Warning("UePcb 1.7B: refusing extra TCP peer; UE PCB session supports Host + 3 Clients");
+						sock_close(conn);
+					}
 				}
 			}
 
@@ -992,19 +1402,26 @@ namespace usb_uepcb
 				}
 				const u32 ln = (static_cast<u32>(hdr[0]) << 24) | (static_cast<u32>(hdr[1]) << 16) |
 					(static_cast<u32>(hdr[2]) << 8) | static_cast<u32>(hdr[3]);
+				if (ln == 0 || ln > 4096)
+				{
+					tcp_remove_peer(s, p);
+					continue;
+				}
+				std::vector<u8> payload(ln);
+				if (!tcp_recv_exact(p, payload.data(), static_cast<int>(ln)))
+				{
+					tcp_remove_peer(s, p);
+					continue;
+				}
+				if (auto_handle_host_control(s, p, payload.data(), static_cast<int>(ln)))
+					continue;
 				if (ln < 14 || ln > 2048)
 				{
 					tcp_remove_peer(s, p);
 					continue;
 				}
-				std::vector<u8> eth(ln);
-				if (!tcp_recv_exact(p, eth.data(), static_cast<int>(ln)))
-				{
-					tcp_remove_peer(s, p);
-					continue;
-				}
-				tcp_push_received_frame(s, eth.data(), static_cast<int>(ln));
-				tcp_host_flood(s, p, eth.data(), static_cast<int>(ln));
+				tcp_push_received_frame(s, payload.data(), static_cast<int>(ln));
+				tcp_host_flood(s, p, payload.data(), static_cast<int>(ln));
 			}
 		}
 	}
@@ -1120,6 +1537,22 @@ namespace usb_uepcb
 
 	static void udp_send_wire_to_destinations(UePcbState* s, const u8* wire, int wire_len)
 	{
+		if (s->connection_mode == 1 && s->tcp_data_mode == 1)
+		{
+			std::vector<sockaddr_in> peers;
+			{
+				std::lock_guard<std::mutex> lk(s->auto_udp_lock);
+				peers = s->auto_udp_peers;
+			}
+			for (const sockaddr_in& dst : peers)
+			{
+				if (s->udp_sock != UEPCB_INVALID_SOCKET)
+					sendto(s->udp_sock, reinterpret_cast<const char*>(wire), wire_len, 0,
+						reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+			}
+			return;
+		}
+
 		if (has_direct_peers(s))
 		{
 			for (size_t i = 0; i < s->peer_ips.size(); ++i)
@@ -1286,9 +1719,14 @@ namespace usb_uepcb
 					std::memcpy(buf, s->tx_accum.data(), n);
 					s->tx_accum.erase(s->tx_accum.begin(), s->tx_accum.begin() + total);
 
-					// Transport send: UDP mesh/broadcast or TCP hub/client.
+					// Transport send: manual UDP, TCP hub, or TCP-bootstrap -> UDP P2P.
 					if (s->connection_mode == 1)
-						tcp_send_packet(s, buf + 2, ethlen);
+					{
+						if (s->tcp_data_mode == 1 && s->auto_udp_ready && s->udp_sock != UEPCB_INVALID_SOCKET)
+							udp_send_packet(s, buf + 2, ethlen);
+						else
+							tcp_send_packet(s, buf + 2, ethlen);
+					}
 					else
 						udp_send_packet(s, buf + 2, ethlen);
 				}
@@ -1309,7 +1747,7 @@ namespace usb_uepcb
 					p->status = USB_RET_STALL;
 					break;
 				}
-				if (s->connection_mode == 0)
+				if (s->connection_mode == 0 || (s->connection_mode == 1 && s->tcp_data_mode == 1))
 				{
 				// Promote a bounded batch only when the emulated USB controller
 				// actually polls the IN endpoint. No peer is waited for and no
@@ -1407,6 +1845,7 @@ namespace usb_uepcb
 		s->udp_port = USB::GetConfigInt(si, port, "UePcb", "Port", 7500);
 		s->tcp_port = s->udp_port;
 		s->tcp_is_host = (USB::GetConfigInt(si, port, "UePcb", "TCPRole", 0) == 0);
+		s->tcp_data_mode = std::clamp(USB::GetConfigInt(si, port, "UePcb", "TCPDataMode", 1), 0, 1);
 		s->tcp_bind_ip = USB::GetConfigString(si, port, "UePcb", "TCPBindIP", "0.0.0.0");
 		s->tcp_host_ip = USB::GetConfigString(si, port, "UePcb", "TCPHostIP", "127.0.0.1");
 
@@ -1463,8 +1902,9 @@ namespace usb_uepcb
 		}
 		std::memcpy(s->an986_regs + 0x10, s->mac, 6);
 
-		Console.WriteLn("UePcb 1.6 settings: mode=%s port=%d Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
+		Console.WriteLn("UePcb 1.7B settings: mode=%s port=%d TCPAfter=%s Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
 			s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
+			s->tcp_data_mode == 0 ? "StayTCP" : "AutoUDP",
 			grace_ms, decay_ms, min_target, max_target, max_packets,
 			s->beta_sync_hold ? "ON" : "OFF", sync_hold_ms,
 			s->beta_adaptive_playout ? "ON" : "OFF", playout_max_ms,
@@ -1499,9 +1939,14 @@ namespace usb_uepcb
 				if (p != UEPCB_INVALID_SOCKET)
 					sock_close(p);
 			s->tcp_peers.clear();
+			s->tcp_peer_meta.clear();
 		}
+		s->auto_udp_ready = false;
+		auto_clear_udp_peers(s);
 		if (s->recv_thread.joinable())
 			s->recv_thread.join();
+		if (s->udp_recv_thread.joinable())
+			s->udp_recv_thread.join();
 	}
 
 	static void clear_transport_queues(UePcbState* s)
@@ -1524,47 +1969,92 @@ namespace usb_uepcb
 		}
 	}
 
-	static bool start_transport(UePcbState* s)
+	static bool open_udp_socket(UePcbState* s, bool auto_allocate)
 	{
-		s->thread_stop = false;
-		if (s->connection_mode == 0)
+		const int base_port = s->udp_port;
+		const int attempts = auto_allocate ? 16 : 1;
+
+		for (int i = 0; i < attempts; ++i)
 		{
-			s->udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-			if (s->udp_sock == UEPCB_INVALID_SOCKET)
+			const int candidate = base_port + i;
+			if (candidate > 65535)
+				break;
+
+			socket_t sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+			if (sock == UEPCB_INVALID_SOCKET)
 			{
 				Console.Error("UePcb: UDP socket creation failed");
 				return false;
 			}
+
 			int one = 1;
-			setsockopt(s->udp_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
-			setsockopt(s->udp_sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
+			if (!auto_allocate)
+				setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
+#ifdef _WIN32
+			else
+				setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&one), sizeof(one));
+#endif
+			setsockopt(sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
 			int rcvbuf = 256 * 1024;
-			setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+			setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 #ifdef _WIN32
 			DWORD recv_timeout_ms = 200;
-			setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
+			setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
 #else
 			timeval recv_timeout{0, 200000};
-			setsockopt(s->udp_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout), sizeof(recv_timeout));
+			setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout), sizeof(recv_timeout));
 #endif
 
 			sockaddr_in bind_addr{};
 			bind_addr.sin_family = AF_INET;
-			bind_addr.sin_port = htons(static_cast<u16>(s->udp_port));
+			bind_addr.sin_port = htons(static_cast<u16>(candidate));
 			bind_addr.sin_addr.s_addr = INADDR_ANY;
-			if (bind(s->udp_sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0)
+			if (bind(sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == 0)
 			{
-				Console.Error("UePcb: UDP bind port %d FAILED", s->udp_port);
-				sock_close(s->udp_sock);
-				s->udp_sock = UEPCB_INVALID_SOCKET;
-				return false;
+				s->udp_sock = sock;
+				s->udp_port = candidate;
+				if (auto_allocate)
+					Console.WriteLn("UePcb 1.7B: Auto UDP local port allocated: %d", candidate);
+				return true;
 			}
+
+			sock_close(sock);
+		}
+
+		Console.Error("UePcb: UDP bind starting at port %d FAILED", base_port);
+		s->udp_sock = UEPCB_INVALID_SOCKET;
+		return false;
+	}
+
+	static bool start_transport(UePcbState* s)
+	{
+		s->thread_stop = false;
+		s->auto_udp_ready = false;
+		auto_clear_udp_peers(s);
+
+		if (s->connection_mode == 0)
+		{
+			if (!open_udp_socket(s, false))
+				return false;
 			s->recv_thread = std::thread(udp_recv_loop, s);
 			return true;
 		}
 
-		Console.WriteLn("UePcb: TCP mode role=%s port=%d %s=%s",
+		// Auto P2P uses TCP only for session/bootstrap/control. Open a dedicated
+		// UDP socket first so the negotiated HELLO advertises the actual bound port.
+		// If UDP cannot be opened, keep TCP alive as a safe fallback instead of
+		// making the whole device fail to start.
+		if (s->tcp_data_mode == 1)
+		{
+			if (open_udp_socket(s, true))
+				s->udp_recv_thread = std::thread(udp_recv_loop, s);
+			else
+				Console.Warning("UePcb 1.7B: Auto UDP unavailable; session will remain on TCP");
+		}
+
+		Console.WriteLn("UePcb: TCP mode role=%s session-port=%d after-connect=%s %s=%s",
 			s->tcp_is_host ? "HOST" : "CLIENT", s->tcp_port,
+			s->tcp_data_mode == 0 ? "STAY-TCP" : "AUTO-UDP-P2P",
 			s->tcp_is_host ? "listen" : "host",
 			s->tcp_is_host ? s->tcp_bind_ip.c_str() : s->tcp_host_ip.c_str());
 		s->recv_thread = std::thread(tcp_transport_loop, s);
@@ -1576,7 +2066,7 @@ namespace usb_uepcb
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
 		stop_transport(s);
 
-		if (s->connection_mode == 0)
+		if (s->connection_mode == 0 || (s->connection_mode == 1 && s->tcp_data_mode == 1))
 		{
 			std::lock_guard<std::mutex> lock(s->jitter_lock);
 			for (const auto& entry : s->peer_jitter)
@@ -1643,7 +2133,7 @@ namespace usb_uepcb
 	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		Console.WriteLn("UePcb 1.6: applying settings live (transport restart only; game stays running)");
+		Console.WriteLn("UePcb 1.7B: applying settings live (transport restart only; game stays running)");
 
 		// Stop socket/thread activity before changing strings, ports or mode.
 		// tx_seq deliberately survives so remote peers do not see our UDP
@@ -1652,12 +2142,12 @@ namespace usb_uepcb
 		clear_transport_queues(s);
 		load_runtime_settings(s, si, s->config_port, false);
 		if (!start_transport(s))
-			Console.Error("UePcb 1.6: live Apply completed, but transport restart failed");
+			Console.Error("UePcb 1.7B: live Apply completed, but transport restart failed");
 		else
-			Console.WriteLn("UePcb 1.6: live Apply complete");
+			Console.WriteLn("UePcb 1.7B: live Apply complete");
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.6"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -1674,12 +2164,13 @@ namespace usb_uepcb
 	{
 		static const char* connection_modes[] = {"UDP", "TCP", nullptr};
 		static const char* tcp_roles[] = {"Host", "Client", nullptr};
+		static const char* tcp_data_modes[] = {"Stay TCP", "Auto UDP P2P", nullptr};
 		static const SettingInfo settings[] = {
 			{.type = SettingInfo::Type::IntegerList, .name = "ConnectionMode", .display_name = "Connection Mode",
-				.description = "UDP is the low-latency Direct Peer/Broadcast mode. TCP uses a Host/Client hub.",
+				.description = "UDP is the low-latency Direct Peer/Broadcast mode. TCP uses a Host/Client session and can either stay on TCP or automatically switch to a discovered UDP P2P mesh.",
 				.default_value = "0", .min_value = "0", .options = connection_modes},
 			{.type = SettingInfo::Type::Integer, .name = "Port", .display_name = "Local UDP / TCP Port",
-				.description = "UDP: this emulator instance's local receive port. TCP: the Host/Client connection port. Default: 7500. Same-PC UDP multi-instance play requires a unique local port per instance (for example 7500, 7501, 7502, 7503).",
+				.description = "UDP: this emulator instance's local receive port. TCP: the shared session port used by Host and all Clients. In Auto UDP P2P, each machine automatically allocates a free UDP port starting from this value. Default: 7500. Manual UDP same-PC multi-instance play still requires unique local ports per instance.",
 				.default_value = "7500", .min_value = "1", .max_value = "65535", .step_value = "1"},
 
 			{.type = SettingInfo::Type::String, .name = "TargetIP", .display_name = "Broadcast Address",
@@ -1697,6 +2188,9 @@ namespace usb_uepcb
 
 			{.type = SettingInfo::Type::IntegerList, .name = "TCPRole", .display_name = "TCP Role",
 				.description = "Host listens and relays frames to all Clients. Client connects to the Host.", .default_value = "0", .min_value = "0", .options = tcp_roles},
+			{.type = SettingInfo::Type::IntegerList, .name = "TCPDataMode", .display_name = "After Connect",
+				.description = "Stay TCP keeps the 1.6 TCP hub for game data. Auto UDP P2P uses TCP to exchange endpoints and then activates a direct UDP mesh. Intended for same-PC, LAN, Tailscale or other mutually-routable VPN peers; direct Internet NAT hole punching is not included in 1.7B.",
+				.default_value = "1", .min_value = "0", .options = tcp_data_modes},
 			{.type = SettingInfo::Type::String, .name = "TCPBindIP", .display_name = "Listen IP",
 				.description = "TCP Host only. 0.0.0.0 listens on all LAN/VPN adapters; 127.0.0.1 limits it to this PC.", .default_value = "0.0.0.0"},
 			{.type = SettingInfo::Type::String, .name = "TCPHostIP", .display_name = "TCP Host IP",
