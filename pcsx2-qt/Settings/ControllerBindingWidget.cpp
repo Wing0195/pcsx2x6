@@ -620,7 +620,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-	// UE PCB 1.6.4B compact TCP/UDP + multi-instance endpoint layout. Detailed help is shown in one
+	// UE PCB 1.6 release compact TCP/UDP + multi-instance endpoint layout. Detailed help is shown in one
 	// fixed description area at the bottom when the pointer enters a setting.
 	if (m_config_prefix == "UePcb_")
 	{
@@ -672,7 +672,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		layout->addWidget(modeLabel, current_row, 0); layout->addWidget(mode, current_row, 1);
 		auto portPair = addInt("Port", tr("Local UDP Port"), 7500, 1, 65535, 1, current_row, 2); current_row++;
 
-		// 1.6.4B: editable IP history and an explicit destination port form one
+		// 1.6: editable IP history and an explicit destination port form one
 		// complete UDP endpoint. Saved IPs are now selected directly inside the
 		// IP field, removing the old Manual-vs-Saved ambiguity.
 		auto peer1 = addEditableIPCombo("Peer1IP", tr("Direct Peer 1 IP"), "", current_row, 0);
@@ -702,7 +702,15 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		QCheckBox* advanced = new QCheckBox(tr("Advanced Settings"), widget_parent);
 		advanced->setObjectName(QStringLiteral("AdvancedSettings"));
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(sif, advanced, m_config_section, m_config_prefix + "AdvancedSettings", false);
-		layout->addWidget(advanced, current_row++, 0, 1, 4);
+		layout->addWidget(advanced, current_row, 0, 1, 2);
+		QLabel* creator = new QLabel(tr("[Create by Wing0195]"), widget_parent);
+		creator->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		layout->addWidget(creator, current_row, 2, 1, 2);
+		current_row++;
+
+		// Advanced UDP tuning. When Advanced Settings is collapsed, the release
+		// defaults remain active internally: Fast Attack 4/250/1/8/8 and Sync Hold
+		// ON at 30 ms. Experimental options stay OFF unless Advanced is enabled.
 		auto grace = addInt("JitterGraceMs", tr("Jitter Grace (ms)"), 4, 0, 20, 1, current_row, 0);
 		auto decay = addInt("JitterDecayMs", tr("Buffer Decay (ms)"), 250, 250, 60000, 250, current_row, 2); current_row++;
 		auto minTarget = addInt("JitterMinTarget", tr("Minimum Target Buffer"), 1, 1, 8, 1, current_row, 0);
@@ -710,10 +718,6 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		auto maxQueue = addInt("JitterMaxPackets", tr("Maximum Jitter Queue"), 8, 1, 32, 1, current_row, 0);
 		auto broadcast = addString("TargetIP", tr("Broadcast Address"), "255.255.255.255", current_row, 2); current_row++;
 
-		// 1.6.4B Sync Priority controls. Sync Hold is the recommended baseline;
-		// the remaining switches stay independent for A/B testing.
-		// Keep both primary timing controls on one compact row. The units live
-		// inside the spin boxes; detailed meanings are in the hover Description.
 		QCheckBox* betaSyncHold = new QCheckBox(tr("Sync Hold"), widget_parent);
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
 			sif, betaSyncHold, m_config_section, m_config_prefix + "BetaSyncHold", true);
@@ -742,26 +746,21 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		layout->addWidget(betaPlayoutMax, current_row, 3);
 		current_row++;
 
-		QCheckBox* betaRetransmit = new QCheckBox(tr("UDP Retransmit"), widget_parent);
-		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
-			sif, betaRetransmit, m_config_section, m_config_prefix + "BetaUdpRetransmit", false);
-		layout->addWidget(betaRetransmit, current_row, 0, 1, 2);
 		QCheckBox* betaStallGuard = new QCheckBox(tr("Global Stall Guard"), widget_parent);
 		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
 			sif, betaStallGuard, m_config_section, m_config_prefix + "BetaGlobalStallGuard", false);
-		layout->addWidget(betaStallGuard, current_row, 2, 1, 2); current_row++;
-
-		auto mac = addString("MacHex", tr("MAC 12-hex"), "", current_row, 0); current_row++;
+		layout->addWidget(betaStallGuard, current_row, 0, 1, 2);
+		auto mac = addString("MacHex", tr("MAC 12-hex"), "", current_row, 2); current_row++;
 
 		// Fixed-height help area: detailed text moves here instead of consuming rows.
-		QLabel* descriptionTitle = new QLabel(tr("Description"), widget_parent);
+		QLabel* descriptionTitle = new QLabel(tr("Description / Connection Guide"), widget_parent);
 		QFont titleFont = descriptionTitle->font(); titleFont.setBold(true); descriptionTitle->setFont(titleFont);
 		layout->addWidget(descriptionTitle, current_row++, 0, 1, 4);
-		const QString defaultHelp = tr("Move the mouse over a UE PCB setting to see detailed information here.");
+		const QString defaultHelp = tr("Recommended: UDP with the default profile (Sync Hold ON). 1PC 4P setup: P1 Local Port 7500, P2 7501, P3 7502, P4 7503. Each player enters 127.0.0.1 with the OTHER three ports: P1 -> 7501/7502/7503; P2 -> 7500/7502/7503; P3 -> 7500/7501/7503; P4 -> 7500/7501/7502. For another PC/Mac, keep 127.0.0.1 only for peers on the same machine; remote peers must use that machine's LAN/Tailscale/VPN IP plus the correct instance port. Move the mouse over a setting for more details.");
 		QLabel* description = new QLabel(defaultHelp, widget_parent);
 		description->setWordWrap(true); description->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-		description->setMinimumHeight(description->fontMetrics().lineSpacing() * 4 + 12);
-		description->setMaximumHeight(description->fontMetrics().lineSpacing() * 5 + 16);
+		description->setMinimumHeight(description->fontMetrics().lineSpacing() * 6 + 12);
+		description->setMaximumHeight(description->fontMetrics().lineSpacing() * 8 + 16);
 		layout->addWidget(description, current_row++, 0, 1, 4);
 		auto* helpFilter = new UePcbDescriptionFilter(description, defaultHelp, widget_parent);
 		const auto help = [&](QWidget* w, const QString& text) { w->setProperty("uepcb_description", text); w->installEventFilter(helpFilter); };
@@ -774,9 +773,9 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 				help(pair.second->lineEdit(), text);
 		};
 
-		const QString modeHelp = tr("UDP is the recommended low-latency mode. In UDP, Local UDP Port is this emulator instance's receive port; each Direct Peer uses its own IP + destination Port. Same-PC multi-instance play must give every emulator a unique Local UDP Port, for example 7500, 7501, 7502 and 7503. TCP keeps the existing Host/Client hub and uses the main port as its TCP connection port.");
+		const QString modeHelp = tr("UDP is the recommended low-latency mode. Each emulator instance is identified by IP + Local UDP Port. For 1PC 4P use Local Ports P1=7500, P2=7501, P3=7502, P4=7503. P1 peers: 127.0.0.1:7501/:7502/:7503; P2 peers: :7500/:7502/:7503; P3 peers: :7500/:7501/:7503; P4 peers: :7500/:7501/:7502. Across another PC/Mac, use that machine's LAN/Tailscale/VPN IP with the destination instance port. TCP keeps the Host/Client hub and uses the main port as its TCP connection port.");
 		help(modeLabel, modeHelp); help(mode, modeHelp); helpPair(portPair, modeHelp);
-		const QString udpHelp = tr("UDP Direct Peer routing uses a complete endpoint: IP + Port. The IP field is editable, and its drop-down directly lists the shared saved-IP history; selecting an item simply fills that IP into the same field. For a 4-player game, enter the other three emulator endpoints and do not enter this instance's own endpoint. If all three peer IPs are empty, UEPCB falls back to Broadcast Address on the Local UDP Port.");
+		const QString udpHelp = tr("Each UDP Direct Peer is one complete endpoint: IP + Port. Enter the OTHER three emulator endpoints; never enter this instance's own endpoint. Same-PC peers use 127.0.0.1 plus their Local Port. Remote peers use the remote machine's LAN/Tailscale/VPN IP plus that instance's Local Port. The IP field is editable and its drop-down contains the shared saved-IP history. If all three peer IPs are empty, UEPCB falls back to Broadcast Address on the Local UDP Port.");
 		helpEditablePair(peer1, udpHelp); helpPair(peer1port, udpHelp);
 		helpEditablePair(peer2, udpHelp); helpPair(peer2port, udpHelp);
 		helpEditablePair(peer3, udpHelp); helpPair(peer3port, udpHelp);
@@ -787,24 +786,24 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		const QString rememberHelp = tr("Save Current IPs stores the current Peer 1-3 IP fields, or the TCP Client Host IP, into the shared 10-entry history immediately. Recent addresses move to the front and duplicates are removed. Ports are not stored in IP history.");
 		help(remember, rememberHelp);
 		help(clear, tr("Clear Saved IPs erases all ten saved addresses and also clears the current UDP Peer IP and TCP Host IP fields. Peer port values are left unchanged."));
-		help(advanced, tr("Leave Advanced Settings unchecked for the 1.6.4B Fast Attack defaults: Jitter Grace 4 ms, Buffer Decay 250 ms, Minimum Target 1, Maximum Target 8 and Queue 8. These values are tuned for fast reaction to real packet disorder and a smooth recovery from Target 8 back to 1 in about 1.75 seconds. Enable Advanced Settings only when manually testing other values. TCP bypasses these controls."));
-		helpPair(grace, tr("Jitter Grace is the quiet window for ordinary short UDP reordering. In 1.6.4B, Fast Attack does not raise the target inside this window. Default: 4 ms. If the gap survives beyond Grace, the target may jump according to gap age and ahead depth before any forced skip occurs."));
+		help(creator, tr("[Create by Wing0195] - UE PCB 1.6 custom TCP/UDP networking build."));
+		help(advanced, tr("Normal play can leave Advanced Settings unchecked. UE PCB 1.6 then forces the tested defaults: Jitter Grace 4 ms, Buffer Decay 250 ms, Target 1-8, Queue 8, and Sync Hold ON at 30 ms. Open Advanced only to tune these values or test experimental features. Adaptive Playout and Global Stall Guard default OFF and may make some connections slower, more laggy, or less stable. TCP bypasses the UDP tuning controls."));
+		helpPair(grace, tr("Jitter Grace is the quiet window for ordinary short UDP reordering. In 1.6, Fast Attack does not raise the target inside this window. Default: 4 ms. If the gap survives beyond Grace, the target may jump according to gap age and ahead depth before any forced skip occurs."));
 		helpPair(decay, tr("Buffer Decay is the stable playback time before the adaptive target drops by one level. Default: 250 ms. With Maximum Target 8, recovery 8 -> 1 takes about 1.75 seconds, giving the intended slow/smooth recovery after a fast rise."));
 		helpPair(minTarget, tr("Minimum Target Buffer sets the lowest adaptive UDP playback depth. Default: 1."));
 		helpPair(maxTarget, tr("Maximum Target Buffer limits Fast Attack growth. Default: 8. A real gap can jump directly to 2/3/5/6/8 depending on how long the expected packet is missing and how many later packets have already arrived; high ping alone does not raise it."));
 		helpPair(maxQueue, tr("Maximum Jitter Queue is the hard per-peer UDP holding limit. Default: 8, matching the new Maximum Target. Keep it small; larger queues can accumulate unnecessary latency."));
 		helpPair(broadcast, tr("Broadcast Address is used only in UDP when all three Direct Peer IPs are empty. Default: 255.255.255.255. Broadcast uses this instance's Local UDP Port; for reliable same-PC multi-instance routing, use explicit Direct Peer IP + Port endpoints instead."));
-		const QString syncHoldHelp = tr("Sync Hold is the recommended synchronization-first option and is ON by default for new/reset 1.6.4B profiles. When a UDP sequence is missing, UEPCB waits up to 30 ms instead of immediately forced-skipping. Fast Attack can raise the target during that wait, so UEPCB reacts to real jitter/bursts without increasing Hold merely because ping is high.");
+		const QString syncHoldHelp = tr("Sync Hold is the recommended synchronization-first setting and is ON by default. In normal mode (Advanced collapsed), UE PCB 1.6 uses Sync Hold ON at 30 ms automatically. When a UDP sequence is missing, it waits for a bounded time instead of immediately forced-skipping; Fast Attack can raise the target during that wait. High ping by itself does not increase the target.");
 		help(betaSyncHold, syncHoldHelp);
 		help(betaHoldMs, syncHoldHelp);
-		const QString playoutHelp = tr("Adaptive Playout is optional. In 1.6.4B the target can now rise through Fast Attack before a forced skip, so Playout may become active earlier when the target is elevated. It still uses 1 ms per buffer step with a 3 ms ceiling. Keep it OFF for the clean Sync Hold baseline, or enable it only for A/B testing because the observed hold can exceed the target until the next USB poll.");
+		const QString playoutHelp = tr("EXPERIMENTAL - default OFF. Adaptive Playout adds a small extra playout delay when the adaptive target rises. It can make some links feel smoother, but testing also showed that the real hold can exceed the selected value until the next USB poll and may make gameplay slower or the connection worse. Enable only for A/B testing; 3 ms is the default test ceiling.");
 		help(betaPlayout, playoutHelp);
 		help(betaPlayoutMax, playoutHelp);
-		help(betaRetransmit, tr("UDP Retransmit remains experimental and is not recommended for normal stable links. It waits until a real gap survives 18 ms, sends one peer-directed NACK, and only that recovery path may extend the wait to about 60 ms. Normal Sync Hold remains 30 ms; 1.6.4B does not use a 120 ms gameplay hold."));
-		help(betaStallGuard, tr("Global Stall Guard remains an optional diagnostic/protection feature. If different peers forced-skip within 100 ms, that pattern can indicate a local PCSX2/USB scheduling stall rather than independent network loss; the guard prevents several peer buffers from staying enlarged. It has not yet been validated as strongly as Sync Hold, so leave it off for the normal baseline."));
-		helpPair(mac, tr("Leave MAC 12-hex blank so each emulator instance automatically generates a unique Namco MAC. Only enter 12 hexadecimal digits when a fixed MAC is specifically required."));
+		help(betaStallGuard, tr("EXPERIMENTAL - default OFF. Global Stall Guard looks for forced skips on different peers within a short window and treats them as a possible local emulator/USB scheduling stall. It has less validation than Sync Hold and may make some connections worse; use only for testing."));
+		helpPair(mac, tr("Advanced: leave MAC 12-hex blank so each emulator instance automatically generates a unique Namco MAC. Only enter 12 hexadecimal digits when a fixed MAC is specifically required."));
 
-		// 1.6.4B: refresh the saved-IP choices without changing the IP currently
+		// 1.6: refresh the saved-IP choices without changing the IP currently
 		// typed/selected in each editable combo.
 		const auto refreshIPCombos = [=]() {
 			for (QComboBox* cb : {peer1.second, peer2.second, peer3.second, hostPair.second})
@@ -869,37 +868,40 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			refreshIPCombos();
 		});
 
-		const auto setPairEnabled = [](auto pair, bool enabled) { pair.first->setEnabled(enabled); pair.second->setEnabled(enabled); };
+		const auto setPairVisible = [](auto pair, bool visible) { pair.first->setVisible(visible); pair.second->setVisible(visible); };
 		const auto updateEnabled = [=]() {
 			const bool isTcp = (mode->currentIndex() == 1);
 			const bool isHost = (role->currentIndex() == 0);
 			const bool adv = advanced->isChecked();
+			const bool showAdvanced = !isTcp && adv;
 
 			portPair.first->setText(isTcp ? tr("TCP Port") : tr("Local UDP Port"));
-			setPairEnabled(peer1, !isTcp); setPairEnabled(peer1port, !isTcp);
-			setPairEnabled(peer2, !isTcp); setPairEnabled(peer2port, !isTcp);
-			setPairEnabled(peer3, !isTcp); setPairEnabled(peer3port, !isTcp);
-			roleLabel->setEnabled(isTcp); role->setEnabled(isTcp);
-			setPairEnabled(bindPair, isTcp && isHost);
-			setPairEnabled(hostPair, isTcp && !isHost);
 
-			const bool jitterEnabled = !isTcp && adv;
-			setPairEnabled(grace, jitterEnabled);
-			setPairEnabled(decay, jitterEnabled);
-			setPairEnabled(minTarget, jitterEnabled);
-			setPairEnabled(maxTarget, jitterEnabled);
-			setPairEnabled(maxQueue, jitterEnabled);
-			setPairEnabled(broadcast, jitterEnabled);
+			// Keep the release UI compact: show only controls relevant to the selected transport.
+			setPairVisible(peer1, !isTcp); setPairVisible(peer1port, !isTcp);
+			setPairVisible(peer2, !isTcp); setPairVisible(peer2port, !isTcp);
+			setPairVisible(peer3, !isTcp); setPairVisible(peer3port, !isTcp);
+			roleLabel->setVisible(isTcp); role->setVisible(isTcp);
+			setPairVisible(bindPair, isTcp && isHost);
+			setPairVisible(hostPair, isTcp && !isHost);
+
 			advanced->setEnabled(!isTcp);
+			setPairVisible(grace, showAdvanced);
+			setPairVisible(decay, showAdvanced);
+			setPairVisible(minTarget, showAdvanced);
+			setPairVisible(maxTarget, showAdvanced);
+			setPairVisible(maxQueue, showAdvanced);
+			setPairVisible(broadcast, showAdvanced);
+			betaSyncHold->setVisible(showAdvanced);
+			betaHoldMs->setVisible(showAdvanced);
+			betaPlayout->setVisible(showAdvanced);
+			betaPlayoutMax->setVisible(showAdvanced);
+			betaStallGuard->setVisible(showAdvanced);
+			setPairVisible(mac, showAdvanced);
 
-			// Beta features are UDP-only. Their switches remain independent,
-			// while numeric fields only unlock when the matching switch is on.
-			betaSyncHold->setEnabled(!isTcp);
-			betaRetransmit->setEnabled(!isTcp);
-			betaPlayout->setEnabled(!isTcp);
-			betaStallGuard->setEnabled(!isTcp);
-			betaHoldMs->setEnabled(!isTcp && betaSyncHold->isChecked());
-			betaPlayoutMax->setEnabled(!isTcp && betaPlayout->isChecked());
+			// Sync Hold is recommended/default ON. Experimental options remain opt-in.
+			betaHoldMs->setEnabled(showAdvanced && betaSyncHold->isChecked());
+			betaPlayoutMax->setEnabled(showAdvanced && betaPlayout->isChecked());
 		};
 		connect(mode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int) { updateEnabled(); });
 		connect(role, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [=](int) { updateEnabled(); });
