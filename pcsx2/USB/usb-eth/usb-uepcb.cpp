@@ -1,17 +1,18 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb 1.7B (Beta)
+// usb-uepcb 1.7.1B (Beta)
 // Created by Wing0195
 // Based on: UE PCB 1.6 release
 //
-// 1.7B beta:
-//   - Adds TCP bootstrap/session discovery with an optional automatic switch to UDP P2P.
-//   - New TCP After Connect mode: Stay TCP or Auto UDP P2P.
-//   - Auto UDP P2P negotiates each instance endpoint over TCP, ACKs a common peer list,
-//     then activates the UDP mesh together. Game traffic stays on TCP until activation.
-//   - Auto UDP ports are allocated per host starting from the TCP session port, allowing
-//     1PC multi-instance play without manually assigning UDP ports.
+// 1.7.1B beta:
+//   - Fixes mixed same-PC + remote Auto UDP P2P endpoint discovery. Loopback Clients are
+//     advertised as 127.0.0.1 only to local recipients and translated to the Host's
+//     reachable TCP-side address for LAN/VPN recipients.
+//   - User-facing defaults are now TCP first and Auto UDP P2P first. New 1.7.1B config
+//     keys avoid misinterpreting numeric selections saved by 1.7B.
+//   - Keeps TCP bootstrap/session discovery, synchronized peer-list ACK/ACTIVATE, automatic
+//     per-host UDP port allocation, and the proven 1.6 UDP synchronization core.
 //   - Direct Internet NAT hole punching is not implemented; Auto UDP P2P is intended for
 //     same-PC, LAN, or mutually-routable VPN/Tailscale peers.
 //
@@ -266,9 +267,9 @@ namespace usb_uepcb
 		int tcp_port = 7500;
 		std::string tcp_host_ip = "127.0.0.1";
 		std::string tcp_bind_ip = "0.0.0.0";
-		// 1.7B: 0 = stay on TCP for game traffic, 1 = use TCP as a bootstrap
-		// session and switch all currently-connected peers to an auto-discovered
-		// UDP P2P mesh after a peer-list/ACK/ACTIVATE handshake.
+		// Internal TCP data-mode semantics remain: 0 = stay TCP, 1 = auto UDP P2P.
+		// Auto mode uses TCP as a bootstrap session and switches all currently-connected
+		// peers to an auto-discovered UDP P2P mesh after peer-list/ACK/ACTIVATE.
 		int tcp_data_mode = 1;
 		std::mutex tcp_sock_lock;
 		socket_t tcp_listen_sock = UEPCB_INVALID_SOCKET;
@@ -925,6 +926,12 @@ namespace usb_uepcb
 		return tcp_send_payload(c, msg.data(), static_cast<int>(msg.size()));
 	}
 
+	static bool auto_ipv4_is_loopback(const sockaddr_in& addr)
+	{
+		const u32 host_order = ntohl(addr.sin_addr.s_addr);
+		return (host_order & 0xff000000u) == 0x7f000000u;
+	}
+
 	static void auto_host_rebuild_session(UePcbState* s)
 	{
 		if (!s->tcp_is_host || s->tcp_data_mode != 1 || s->udp_sock == UEPCB_INVALID_SOCKET)
@@ -970,7 +977,7 @@ namespace usb_uepcb
 			host_peers.push_back(ep);
 			char ipbuf[INET_ADDRSTRLEN] = {};
 			if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
-				Console.WriteLn("UePcb 1.7B: discovered Client UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(rp.udp_port));
+				Console.WriteLn("UePcb 1.7.1B: discovered Client UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(rp.udp_port));
 		}
 		auto_set_udp_peers(s, host_peers);
 
@@ -978,11 +985,12 @@ namespace usb_uepcb
 		{
 			std::vector<std::pair<sockaddr_in, std::array<u8, 6>>> entries;
 
-			// Advertise the Host endpoint using the local address of this exact
-			// TCP connection. This naturally gives 127.0.0.1 for same-PC clients,
-			// a LAN address for LAN clients, and a Tailscale/VPN address when the
-			// TCP session itself was established over that adapter.
+			// Resolve the Host address from the exact TCP path used by this recipient.
+			// Same-PC clients see 127.0.0.1, while a remote LAN/VPN client sees the
+			// Host interface address it actually connected to. The same address is also
+			// used below to translate *other* same-PC Clients for remote recipients.
 			sockaddr_in host_ep{};
+			bool have_host_ep = false;
 #ifdef _WIN32
 			int host_len = sizeof(host_ep);
 #else
@@ -990,6 +998,7 @@ namespace usb_uepcb
 #endif
 			if (getsockname(recipient.sock, reinterpret_cast<sockaddr*>(&host_ep), &host_len) == 0)
 			{
+				have_host_ep = true;
 				host_ep.sin_port = htons(static_cast<u16>(s->udp_port));
 				std::array<u8, 6> host_mac{};
 				std::memcpy(host_mac.data(), s->mac, 6);
@@ -1000,8 +1009,17 @@ namespace usb_uepcb
 			{
 				if (other.sock == recipient.sock)
 					continue;
+
 				sockaddr_in ep = other.remote;
 				ep.sin_port = htons(other.udp_port);
+
+				// Critical mixed local/remote fix: 127.0.0.1 is meaningful only on the
+				// Host machine. If P3/P4 connected to P1 through loopback, never advertise
+				// that loopback address to an iMac/remote recipient. Translate it to the
+				// Host's reachable address on this recipient's TCP connection instead.
+				if (auto_ipv4_is_loopback(ep) && !auto_ipv4_is_loopback(recipient.remote) && have_host_ep)
+					ep.sin_addr = host_ep.sin_addr;
+
 				entries.emplace_back(ep, other.mac);
 				if (entries.size() >= 3)
 					break;
@@ -1028,7 +1046,7 @@ namespace usb_uepcb
 			}
 		}
 
-		Console.WriteLn("UePcb 1.7B: TCP bootstrap peer list generation %u sent (%d client%s, UDP local %d)",
+		Console.WriteLn("UePcb 1.7.1B: TCP bootstrap peer list generation %u sent (%d client%s, UDP local %d)",
 			generation, static_cast<int>(ready.size()), ready.size() == 1 ? "" : "s", s->udp_port);
 	}
 
@@ -1060,7 +1078,7 @@ namespace usb_uepcb
 		for (socket_t p : ready_sockets)
 			auto_send_activate(s, p, generation);
 		s->auto_udp_ready = true;
-		Console.WriteLn("UePcb 1.7B: Auto UDP P2P ACTIVE generation %u (%d peer%s)",
+		Console.WriteLn("UePcb 1.7.1B: Auto UDP P2P ACTIVE generation %u (%d peer%s)",
 			generation, static_cast<int>(ready_sockets.size()), ready_sockets.size() == 1 ? "" : "s");
 	}
 
@@ -1090,12 +1108,12 @@ namespace usb_uepcb
 				peers.push_back(ep);
 				char ipbuf[INET_ADDRSTRLEN] = {};
 				if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
-					Console.WriteLn("UePcb 1.7B: peer-list UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(ntohs(ep.sin_port)));
+					Console.WriteLn("UePcb 1.7.1B: peer-list UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(ntohs(ep.sin_port)));
 			}
 		}
 		auto_set_udp_peers(s, peers);
 		auto_send_ack(s, conn, generation);
-		Console.WriteLn("UePcb 1.7B: received Auto UDP peer list generation %u (%d endpoint%s); ACK sent",
+		Console.WriteLn("UePcb 1.7.1B: received Auto UDP peer list generation %u (%d endpoint%s); ACK sent",
 			generation, static_cast<int>(peers.size()), peers.size() == 1 ? "" : "s");
 	}
 
@@ -1105,7 +1123,7 @@ namespace usb_uepcb
 			return false;
 		if (s->tcp_data_mode != 1)
 		{
-			Console.Warning("UePcb 1.7B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			Console.Warning("UePcb 1.7.1B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
 			return true;
 		}
 		const u8 type = data[4];
@@ -1117,7 +1135,7 @@ namespace usb_uepcb
 			if (generation == s->auto_client_generation && generation != 0)
 			{
 				s->auto_udp_ready = true;
-				Console.WriteLn("UePcb 1.7B: Auto UDP P2P ACTIVE generation %u", generation);
+				Console.WriteLn("UePcb 1.7.1B: Auto UDP P2P ACTIVE generation %u", generation);
 			}
 		}
 		return true;
@@ -1129,7 +1147,7 @@ namespace usb_uepcb
 			return false;
 		if (s->tcp_data_mode != 1)
 		{
-			Console.Warning("UePcb 1.7B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			Console.Warning("UePcb 1.7.1B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
 			return true;
 		}
 
@@ -1278,7 +1296,7 @@ namespace usb_uepcb
 					if (s->tcp_data_mode == 1 && s->udp_sock != UEPCB_INVALID_SOCKET)
 					{
 						if (auto_send_hello(s, conn))
-							Console.WriteLn("UePcb 1.7B: Auto UDP HELLO sent (local UDP %d)", s->udp_port);
+							Console.WriteLn("UePcb 1.7.1B: Auto UDP HELLO sent (local UDP %d)", s->udp_port);
 					}
 					tcp_client_recv_loop(s, conn);
 
@@ -1384,7 +1402,7 @@ namespace usb_uepcb
 					}
 					if (!accepted)
 					{
-						Console.Warning("UePcb 1.7B: refusing extra TCP peer; UE PCB session supports Host + 3 Clients");
+						Console.Warning("UePcb 1.7.1B: refusing extra TCP peer; UE PCB session supports Host + 3 Clients");
 						sock_close(conn);
 					}
 				}
@@ -1838,14 +1856,20 @@ namespace usb_uepcb
 	static void load_runtime_settings(UePcbState* s, SettingsInterface& si, u32 port, bool initial)
 	{
 		s->config_port = port;
-		s->connection_mode = std::clamp(USB::GetConfigInt(si, port, "UePcb", "ConnectionMode", 0), 0, 1);
+		// 1.7.1B user-facing order is TCP first, UDP second. Keep the internal
+		// transport semantics unchanged (0=UDP, 1=TCP) by translating here.
+		const int connection_mode_ui = std::clamp(USB::GetConfigInt(si, port, "UePcb", "ConnectionMode171", 0), 0, 1);
+		s->connection_mode = (connection_mode_ui == 0) ? 1 : 0;
 		s->advanced_settings = USB::GetConfigBool(si, port, "UePcb", "AdvancedSettings", false);
 		s->broadcast_ip = s->advanced_settings ?
 			USB::GetConfigString(si, port, "UePcb", "TargetIP", "255.255.255.255") : "255.255.255.255";
 		s->udp_port = USB::GetConfigInt(si, port, "UePcb", "Port", 7500);
 		s->tcp_port = s->udp_port;
 		s->tcp_is_host = (USB::GetConfigInt(si, port, "UePcb", "TCPRole", 0) == 0);
-		s->tcp_data_mode = std::clamp(USB::GetConfigInt(si, port, "UePcb", "TCPDataMode", 1), 0, 1);
+		// 1.7.1B user-facing order is Auto UDP P2P first, Stay TCP second. Internal
+		// semantics remain 0=Stay TCP, 1=Auto UDP P2P.
+		const int tcp_data_mode_ui = std::clamp(USB::GetConfigInt(si, port, "UePcb", "TCPDataMode171", 0), 0, 1);
+		s->tcp_data_mode = (tcp_data_mode_ui == 0) ? 1 : 0;
 		s->tcp_bind_ip = USB::GetConfigString(si, port, "UePcb", "TCPBindIP", "0.0.0.0");
 		s->tcp_host_ip = USB::GetConfigString(si, port, "UePcb", "TCPHostIP", "127.0.0.1");
 
@@ -1902,7 +1926,7 @@ namespace usb_uepcb
 		}
 		std::memcpy(s->an986_regs + 0x10, s->mac, 6);
 
-		Console.WriteLn("UePcb 1.7B settings: mode=%s port=%d TCPAfter=%s Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
+		Console.WriteLn("UePcb 1.7.1B settings: mode=%s port=%d TCPAfter=%s Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
 			s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
 			s->tcp_data_mode == 0 ? "StayTCP" : "AutoUDP",
 			grace_ms, decay_ms, min_target, max_target, max_packets,
@@ -2014,7 +2038,7 @@ namespace usb_uepcb
 				s->udp_sock = sock;
 				s->udp_port = candidate;
 				if (auto_allocate)
-					Console.WriteLn("UePcb 1.7B: Auto UDP local port allocated: %d", candidate);
+					Console.WriteLn("UePcb 1.7.1B: Auto UDP local port allocated: %d", candidate);
 				return true;
 			}
 
@@ -2049,7 +2073,7 @@ namespace usb_uepcb
 			if (open_udp_socket(s, true))
 				s->udp_recv_thread = std::thread(udp_recv_loop, s);
 			else
-				Console.Warning("UePcb 1.7B: Auto UDP unavailable; session will remain on TCP");
+				Console.Warning("UePcb 1.7.1B: Auto UDP unavailable; session will remain on TCP");
 		}
 
 		Console.WriteLn("UePcb: TCP mode role=%s session-port=%d after-connect=%s %s=%s",
@@ -2133,7 +2157,7 @@ namespace usb_uepcb
 	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		Console.WriteLn("UePcb 1.7B: applying settings live (transport restart only; game stays running)");
+		Console.WriteLn("UePcb 1.7.1B: applying settings live (transport restart only; game stays running)");
 
 		// Stop socket/thread activity before changing strings, ports or mode.
 		// tx_seq deliberately survives so remote peers do not see our UDP
@@ -2142,12 +2166,12 @@ namespace usb_uepcb
 		clear_transport_queues(s);
 		load_runtime_settings(s, si, s->config_port, false);
 		if (!start_transport(s))
-			Console.Error("UePcb 1.7B: live Apply completed, but transport restart failed");
+			Console.Error("UePcb 1.7.1B: live Apply completed, but transport restart failed");
 		else
-			Console.WriteLn("UePcb 1.7B: live Apply complete");
+			Console.WriteLn("UePcb 1.7.1B: live Apply complete");
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7B"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7.1B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -2162,12 +2186,12 @@ namespace usb_uepcb
 
 	std::span<const SettingInfo> UePcbDevice::Settings(u32 subtype) const
 	{
-		static const char* connection_modes[] = {"UDP", "TCP", nullptr};
+		static const char* connection_modes[] = {"TCP", "UDP", nullptr};
 		static const char* tcp_roles[] = {"Host", "Client", nullptr};
-		static const char* tcp_data_modes[] = {"Stay TCP", "Auto UDP P2P", nullptr};
+		static const char* tcp_data_modes[] = {"Auto UDP P2P", "Stay TCP", nullptr};
 		static const SettingInfo settings[] = {
-			{.type = SettingInfo::Type::IntegerList, .name = "ConnectionMode", .display_name = "Connection Mode",
-				.description = "UDP is the low-latency Direct Peer/Broadcast mode. TCP uses a Host/Client session and can either stay on TCP or automatically switch to a discovered UDP P2P mesh.",
+			{.type = SettingInfo::Type::IntegerList, .name = "ConnectionMode171", .display_name = "Connection Mode",
+				.description = "TCP is the recommended default and can automatically switch to a discovered UDP P2P mesh. UDP remains available for manual Direct Peer/Broadcast setup.",
 				.default_value = "0", .min_value = "0", .options = connection_modes},
 			{.type = SettingInfo::Type::Integer, .name = "Port", .display_name = "Local UDP / TCP Port",
 				.description = "UDP: this emulator instance's local receive port. TCP: the shared session port used by Host and all Clients. In Auto UDP P2P, each machine automatically allocates a free UDP port starting from this value. Default: 7500. Manual UDP same-PC multi-instance play still requires unique local ports per instance.",
@@ -2188,9 +2212,9 @@ namespace usb_uepcb
 
 			{.type = SettingInfo::Type::IntegerList, .name = "TCPRole", .display_name = "TCP Role",
 				.description = "Host listens and relays frames to all Clients. Client connects to the Host.", .default_value = "0", .min_value = "0", .options = tcp_roles},
-			{.type = SettingInfo::Type::IntegerList, .name = "TCPDataMode", .display_name = "After Connect",
-				.description = "Stay TCP keeps the 1.6 TCP hub for game data. Auto UDP P2P uses TCP to exchange endpoints and then activates a direct UDP mesh. Intended for same-PC, LAN, Tailscale or other mutually-routable VPN peers; direct Internet NAT hole punching is not included in 1.7B.",
-				.default_value = "1", .min_value = "0", .options = tcp_data_modes},
+			{.type = SettingInfo::Type::IntegerList, .name = "TCPDataMode171", .display_name = "After Connect",
+				.description = "Auto UDP P2P is the recommended default: TCP exchanges endpoints and then activates a direct UDP mesh. 1.7.1B also translates same-PC loopback peers to a Host address reachable by remote Clients. Stay TCP remains available as the second option. Direct Internet NAT hole punching is not included.",
+				.default_value = "0", .min_value = "0", .options = tcp_data_modes},
 			{.type = SettingInfo::Type::String, .name = "TCPBindIP", .display_name = "Listen IP",
 				.description = "TCP Host only. 0.0.0.0 listens on all LAN/VPN adapters; 127.0.0.1 limits it to this PC.", .default_value = "0.0.0.0"},
 			{.type = SettingInfo::Type::String, .name = "TCPHostIP", .display_name = "TCP Host IP",
