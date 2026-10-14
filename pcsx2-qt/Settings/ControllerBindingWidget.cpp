@@ -620,11 +620,11 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 	SettingsInterface* sif = m_dialog->getProfileSettingsInterface();
 	int current_row = 0;
 
-	// UE PCB 1.7.1B compact TCP bootstrap / UDP P2P + manual endpoint layout. Detailed help is shown in one
+	// UE PCB 1.7.2B compact TCP bootstrap / UDP P2P + manual endpoint layout. Detailed help is shown in one
 	// fixed description area at the bottom when the pointer enters a setting.
 	if (m_config_prefix == "UePcb_")
 	{
-		// 1.7.1B: keep the two label columns fixed so opening Advanced Settings
+		// 1.7.2B: keep the two label columns fixed so opening Advanced Settings
 		// cannot widen long labels and make the input boxes jump horizontally.
 		constexpr int kUePcbLabelWidth = 180;
 		constexpr int kUePcbInputMinWidth = 190;
@@ -742,8 +742,19 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		layout->addWidget(creator, current_row, 2, 1, 2);
 		current_row++;
 
+		QCheckBox* fastAttack = new QCheckBox(tr("Fast Attack"), widget_parent);
+		fastAttack->setObjectName(QStringLiteral("FastAttackEnabled"));
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, fastAttack, m_config_section, m_config_prefix + "FastAttackEnabled", true);
+		layout->addWidget(fastAttack, current_row, 0, 1, 2);
+		QCheckBox* localTiming = new QCheckBox(tr("Local Timing Protection"), widget_parent);
+		localTiming->setObjectName(QStringLiteral("LocalTimingProtection"));
+		ControllerSettingWidgetBinder::BindWidgetToInputProfileBool(
+			sif, localTiming, m_config_section, m_config_prefix + "LocalTimingProtection", true);
+		layout->addWidget(localTiming, current_row, 2, 1, 2); current_row++;
+
 		// Advanced UDP tuning. When Advanced Settings is collapsed, the release
-		// defaults remain active internally: Fast Attack 4/250/1/8/8 and Sync Hold
+		// defaults remain active internally: Grace 4/Decay 250/Target 1-8/Queue 8 and Sync Hold
 		// ON at 30 ms. Experimental options stay OFF unless Advanced is enabled.
 		auto grace = addInt("JitterGraceMs", tr("Jitter Grace (ms)"), 4, 0, 20, 1, current_row, 0);
 		auto decay = addInt("JitterDecayMs", tr("Buffer Decay (ms)"), 250, 250, 60000, 250, current_row, 2); current_row++;
@@ -792,7 +803,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		QLabel* descriptionTitle = new QLabel(tr("Description / Connection Guide"), widget_parent);
 		QFont titleFont = descriptionTitle->font(); titleFont.setBold(true); descriptionTitle->setFont(titleFont);
 		layout->addWidget(descriptionTitle, current_row++, 0, 1, 4);
-		const QString defaultHelp = tr("UE PCB 1.7.1B adds TCP bootstrap -> Auto UDP P2P. Easiest 1PC 4P: select TCP + Auto UDP P2P on all four instances, use TCP Session Port 7500 on all, set P1=Host and P2/P3/P4=Client with Host IP 127.0.0.1. UDP ports are allocated automatically (normally 7500-7503), so no Direct Peer entries are needed. Across PC/Mac/Tailscale, Clients enter the Host machine\'s reachable LAN/VPN IP; 1.7.1B automatically translates same-PC loopback peers to the Host\'s reachable address for remote machines, then activates the P2P mesh after every connected Client ACKs its peer list. Direct Internet NAT hole punching is not included in 1.7.1B. Manual UDP remains available exactly as in 1.6. Move the mouse over a setting for details.");
+		const QString defaultHelp = tr("UE PCB 1.7.2B adds TCP bootstrap -> Auto UDP P2P. Easiest 1PC 4P: select TCP + Auto UDP P2P on all four instances, use TCP Session Port 7500 on all, set P1=Host and P2/P3/P4=Client with Host IP 127.0.0.1. UDP ports are allocated automatically (normally 7500-7503), so no Direct Peer entries are needed. Across PC/Mac/Tailscale, Clients enter the Host machine\'s reachable LAN/VPN IP; 1.7.2B automatically translates same-PC loopback peers to the Host\'s reachable address for remote machines, then activates the P2P mesh after every connected Client ACKs its peer list. Direct Internet NAT hole punching is not included in 1.7.2B. Manual UDP remains available exactly as in 1.6. Move the mouse over a setting for details.");
 		QLabel* description = new QLabel(defaultHelp, widget_parent);
 		description->setWordWrap(true); description->setAlignment(Qt::AlignLeft | Qt::AlignTop);
 		description->setMinimumHeight(description->fontMetrics().lineSpacing() * 6 + 12);
@@ -809,7 +820,7 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 				help(pair.second->lineEdit(), text);
 		};
 
-		const QString modeHelp = tr("TCP is the recommended first option. Manual UDP keeps the proven 1.6 Direct Peer IP+Port mesh, while TCP adds a Host/Client session. With the recommended After Connect=Auto UDP P2P, TCP first discovers every instance\'s IP/UDP port/MAC, distributes a recipient-aware peer list, waits for ACKs, then activates direct UDP P2P while keeping TCP alive as the control channel. Auto P2P is intended for same-PC, LAN, Tailscale or another mutually-routable VPN; 1.7.1B does not perform public-Internet NAT hole punching.");
+		const QString modeHelp = tr("TCP is the recommended first option. Manual UDP keeps the proven 1.6 Direct Peer IP+Port mesh, while TCP adds a Host/Client session. With the recommended After Connect=Auto UDP P2P, TCP first discovers every instance\'s IP/UDP port/MAC, distributes a recipient-aware peer list, waits for ACKs, then activates direct UDP P2P while keeping TCP alive as the control channel. Auto P2P is intended for same-PC, LAN, Tailscale or another mutually-routable VPN; 1.7.2B does not perform public-Internet NAT hole punching.");
 		help(modeLabel, modeHelp); help(mode, modeHelp);
 		helpPair(portPair, tr("Manual UDP: Local receive port for this emulator instance; same-PC multi-instance UDP needs unique ports such as 7500/7501/7502/7503. TCP: shared Session Port used by the Host and every Client, normally 7500. In Auto UDP P2P, each machine automatically claims a free UDP port starting from this Session Port; multiple instances on one PC normally become UDP 7500/7501/7502/7503 without manual Peer Port setup."));
 		const QString udpHelp = tr("Each UDP Direct Peer is one complete endpoint: IP + Port. Enter the OTHER three emulator endpoints; never enter this instance's own endpoint. Same-PC peers use 127.0.0.1 plus their Local Port. Remote peers use the remote machine's LAN/Tailscale/VPN IP plus that instance's Local Port. The IP field is editable and its drop-down contains the shared saved-IP history. If all three peer IPs are empty, UEPCB falls back to Broadcast Address on the Local UDP Port.");
@@ -818,22 +829,24 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 		helpEditablePair(peer3, udpHelp); helpPair(peer3port, udpHelp);
 		const QString tcpRoleHelp = tr("TCP Host accepts up to three Clients; Client connects to that Host. In Stay TCP, the Host relays Ethernet frames exactly like 1.6. In Auto UDP P2P, TCP becomes the bootstrap/control channel and the Host coordinates endpoint exchange plus synchronized activation of the UDP mesh.");
 		help(roleLabel, tcpRoleHelp); help(role, tcpRoleHelp);
-		const QString afterConnectHelp = tr("Auto UDP P2P (recommended, 1.7.1B beta): establish TCP first, automatically allocate a free local UDP port starting at the TCP Session Port, exchange IP+Port+MAC endpoints, wait for all connected Clients to ACK the same list, then switch game traffic to direct UDP P2P. Before activation, gameplay stays on TCP so the switch does not intentionally drop setup traffic. 1PC 4P: all use TCP Session Port 7500; P1 Host, P2-P4 Client to 127.0.0.1. Across machines, Clients use the Host LAN/Tailscale/VPN IP. No public NAT hole punching yet. If a firewall is enabled, allow the TCP Session Port and the auto UDP range starting at that port (1.7.1B tries up to 16 ports, e.g. 7500-7515). Stay TCP is the second option and keeps all game Ethernet traffic on the TCP Host/Client hub.");
+		const QString afterConnectHelp = tr("Auto UDP P2P (recommended, 1.7.2B beta): establish TCP first, automatically allocate a free local UDP port starting at the TCP Session Port, exchange IP+Port+MAC endpoints, wait for all connected Clients to ACK the same list, then switch game traffic to direct UDP P2P. Before activation, gameplay stays on TCP so the switch does not intentionally drop setup traffic. 1PC 4P: all use TCP Session Port 7500; P1 Host, P2-P4 Client to 127.0.0.1. Across machines, Clients use the Host LAN/Tailscale/VPN IP. No public NAT hole punching yet. If a firewall is enabled, allow the TCP Session Port and the auto UDP range starting at that port (1.7.2B tries up to 16 ports, e.g. 7500-7515). Stay TCP is the second option and keeps all game Ethernet traffic on the TCP Host/Client hub.");
 		help(afterConnectLabel, afterConnectHelp); help(afterConnect, afterConnectHelp);
 		helpPair(bindPair, tr("TCP Host Listen IP: 0.0.0.0 accepts connections on all LAN/VPN adapters. Use 127.0.0.1 only when every instance is on the same PC. This field is ignored in TCP Client mode."));
 		helpEditablePair(hostPair, tr("TCP Client Host IP is now also an editable saved-IP drop-down. Type an address directly or select one from the shared history. Use 127.0.0.1 for same-PC TCP; across LAN or VPN, use the Host machine's LAN/Tailscale/VPN address."));
 		const QString rememberHelp = tr("Save Current IPs stores the current Peer 1-3 IP fields, or the TCP Client Host IP, into the shared 10-entry history immediately. Recent addresses move to the front and duplicates are removed. Ports are not stored in IP history.");
 		help(remember, rememberHelp);
 		help(clear, tr("Clear Saved IPs erases all ten saved addresses and also clears the current UDP Peer IP and TCP Host IP fields. Peer port values are left unchanged."));
-		help(creator, tr("[Create by Wing0195] - UE PCB 1.7.1B TCP bootstrap / Auto UDP P2P beta build."));
-		help(advanced, tr("Normal play can leave Advanced Settings unchecked. UE PCB 1.7.1B then forces the tested defaults: Jitter Grace 4 ms, Buffer Decay 250 ms, Target 1-8, Queue 8, and Sync Hold ON at 30 ms. Open Advanced only to tune these values or test experimental features. Adaptive Playout and Global Stall Guard default OFF and may make some connections slower, more laggy, or less stable. Stay TCP bypasses the UDP tuning controls; TCP Auto UDP P2P uses them after activation."));
-		helpPair(grace, tr("Jitter Grace is the quiet window for ordinary short UDP reordering. In 1.7.1B, Fast Attack does not raise the target inside this window. Default: 4 ms. If the gap survives beyond Grace, the target may jump according to gap age and ahead depth before any forced skip occurs."));
+		help(creator, tr("[Create by Wing0195] - UE PCB 1.7.2B TCP bootstrap / Auto UDP P2P beta build."));
+		help(fastAttack, tr("Fast Attack ON (default) raises the adaptive target when a UDP sequence gap persists. Turn it OFF to stop automatic target increases; the jitter queue and Sync Hold still operate."));
+		help(localTiming, tr("Local Timing Protection ON (default) detects sequence gaps on multiple peer streams within 30 ms and suppresses Fast Attack for that poll cycle, reducing false buffer growth when several emulator instances stall together. It is heuristic, not a definitive detector of same-PC peers."));
+		help(advanced, tr("Normal play can leave Advanced Settings unchecked. UE PCB 1.7.2B then forces the tested defaults: Jitter Grace 4 ms, Buffer Decay 250 ms, Target 1-8, Queue 8, and Sync Hold ON at 30 ms. Open Advanced only to tune these values or test experimental features. Adaptive Playout and Global Stall Guard default OFF and may make some connections slower, more laggy, or less stable. Stay TCP bypasses the UDP tuning controls; TCP Auto UDP P2P uses them after activation."));
+		helpPair(grace, tr("Jitter Grace is the quiet window for ordinary short UDP reordering. In 1.7.2B, Fast Attack does not raise the target inside this window. Default: 4 ms. If the gap survives beyond Grace, the target may jump according to gap age and ahead depth before any forced skip occurs."));
 		helpPair(decay, tr("Buffer Decay is the stable playback time before the adaptive target drops by one level. Default: 250 ms. With Maximum Target 8, recovery 8 -> 1 takes about 1.75 seconds, giving the intended slow/smooth recovery after a fast rise."));
 		helpPair(minTarget, tr("Minimum Target Buffer sets the lowest adaptive UDP playback depth. Default: 1."));
 		helpPair(maxTarget, tr("Maximum Target Buffer limits Fast Attack growth. Default: 8. A real gap can jump directly to 2/3/5/6/8 depending on how long the expected packet is missing and how many later packets have already arrived; high ping alone does not raise it."));
 		helpPair(maxQueue, tr("Maximum Jitter Queue is the hard per-peer UDP holding limit. Default: 8, matching the new Maximum Target. Keep it small; larger queues can accumulate unnecessary latency."));
 		helpPair(broadcast, tr("Broadcast Address is used only in UDP when all three Direct Peer IPs are empty. Default: 255.255.255.255. Broadcast uses this instance's Local UDP Port; for reliable same-PC multi-instance routing, use explicit Direct Peer IP + Port endpoints instead."));
-		const QString syncHoldHelp = tr("Sync Hold is the recommended synchronization-first setting and is ON by default. In normal mode (Advanced collapsed), UE PCB 1.7.1B uses Sync Hold ON at 30 ms automatically. When a UDP sequence is missing, it waits for a bounded time instead of immediately forced-skipping; Fast Attack can raise the target during that wait. High ping by itself does not increase the target.");
+		const QString syncHoldHelp = tr("Sync Hold is the recommended synchronization-first setting and is ON by default. In normal mode (Advanced collapsed), UE PCB 1.7.2B uses Sync Hold ON at 30 ms automatically. When a UDP sequence is missing, it waits for a bounded time instead of immediately forced-skipping; Fast Attack can raise the target during that wait. High ping by itself does not increase the target.");
 		help(betaSyncHold, syncHoldHelp);
 		help(betaHoldMs, syncHoldHelp);
 		const QString playoutHelp = tr("EXPERIMENTAL - default OFF. Adaptive Playout adds a small extra playout delay when the adaptive target rises. It can make some links feel smoother, but testing also showed that the real hold can exceed the selected value until the next USB poll and may make gameplay slower or the connection worse. Enable only for A/B testing; 3 ms is the default test ceiling.");
@@ -928,6 +941,8 @@ void ControllerCustomSettingsWidget::createSettingWidgets(const char* translatio
 			setPairVisible(hostPair, isTcp && !isHost);
 
 			advanced->setEnabled(usesUdpData);
+			fastAttack->setVisible(usesUdpData);
+			localTiming->setVisible(usesUdpData);
 			setPairVisible(grace, showAdvanced);
 			setPairVisible(decay, showAdvanced);
 			setPairVisible(minTarget, showAdvanced);

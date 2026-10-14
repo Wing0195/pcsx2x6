@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb 1.7.1B (Beta)
+// usb-uepcb 1.7.2B (Beta)
 // Created by Wing0195
 // Based on: UE PCB 1.6 release
 //
-// 1.7.1B beta:
+// 1.7.2B beta:
+//   - Adds independent Fast Attack ON/OFF control (default ON).
+//   - Adds Local Timing Protection (default ON): if multiple peer streams develop
+//     sequence gaps within a 30 ms window, suppresses Fast Attack for that poll
+//     cycle because a shared emulator/USB scheduling stall is more likely.
+//   - Uses gentler Fast Attack steps to reduce buffer jumps from short local stalls.
+//   - Keeps global cross-instance release barriers out of this build; no emulator
+//     thread is blocked waiting for another instance.
 //   - Fixes mixed same-PC + remote Auto UDP P2P endpoint discovery. Loopback Clients are
 //     advertised as 127.0.0.1 only to local recipients and translated to the Host's
 //     reachable TCP-side address for LAN/VPN recipients.
-//   - User-facing defaults are now TCP first and Auto UDP P2P first. New 1.7.1B config
+//   - User-facing defaults are now TCP first and Auto UDP P2P first. New 1.7.2B config
 //     keys avoid misinterpreting numeric selections saved by 1.7B.
 //   - Keeps TCP bootstrap/session discovery, synchronized peer-list ACK/ACTIVATE, automatic
 //     per-host UDP port allocation, and the proven 1.6 UDP synchronization core.
@@ -29,6 +36,13 @@
 //   - TCP RX uses the fixed AN986 BULK IN wrapper (odd Ethernet lengths get 1-byte pad).
 //   - Adds Advanced Settings gate for UDP jitter tuning.
 //   - Keeps shared Saved IP history for UDP peers and TCP Host IP.
+//
+// Earlier history (from the project's known notes):
+//   - 1.0: original UE PCB implementation.
+//   - 1.1: Gundam NEXT compatibility/fix release.
+//   - 1.2: exact change notes are not available in the recovered source history;
+//     intentionally not guessed here.
+//   - 1.3: adaptive per-peer jitter buffer and diagnostic groundwork (1.3.x).
 //
 // 1.4 changes:
 //   - Polished compact two-column UEPCB settings UI (paired ControllerBindingWidget file).
@@ -250,6 +264,11 @@ namespace usb_uepcb
 		bool beta_adaptive_playout = false;
 		std::chrono::milliseconds beta_playout_max{3};
 		bool beta_global_stall_guard = false;
+		// 1.7.2B user controls. Fast Attack can be disabled without disabling the
+		// ordinary jitter queue / Sync Hold behavior. Local protection suppresses
+		// aggressive adaptation when several peer streams gap together.
+		bool fast_attack_enabled = true;
+		bool local_timing_protection = true;
 
 		// Transport selection: 0 = UDP, 1 = TCP.
 		int connection_mode = 0;
@@ -598,33 +617,40 @@ namespace usb_uepcb
 					// combine gap age with the amount of already-arrived future data.
 					// High RTT by itself never changes the target; only actual missing/
 					// reordered delivery pressure does.
-					if (gap_age >= s->jitter_grace && jb.target_packets < s->jitter_max_target)
+					bool simultaneous_peer_gaps = false;
+					if (s->local_timing_protection)
+					{
+						unsigned active_gaps = 0;
+						for (const auto& other : s->peer_jitter)
+						{
+							if (other.first == entry.first || !other.second.gap_active)
+								continue;
+							const auto other_gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - other.second.gap_since);
+							if (other_gap.count() >= 0 && other_gap <= std::chrono::milliseconds(30))
+								++active_gaps;
+						}
+						simultaneous_peer_gaps = (active_gaps > 0);
+					}
+
+					if (s->fast_attack_enabled && !simultaneous_peer_gaps &&
+						gap_age >= s->jitter_grace && jb.target_packets < s->jitter_max_target)
 					{
 						u32 age_target = s->jitter_min_target;
 						const long long age_ms = gap_age.count();
-						if (age_ms >= 25)
-							age_target = s->jitter_max_target;
-						else if (age_ms >= 18)
-							age_target = std::min<u32>(s->jitter_max_target, 6);
-						else if (age_ms >= 12)
-							age_target = std::min<u32>(s->jitter_max_target, 5);
-						else if (age_ms >= 8)
-							age_target = std::min<u32>(s->jitter_max_target, 3);
-						else
-							age_target = std::min<u32>(s->jitter_max_target, 2);
+						// Gentler 1.7.2B attack curve: short gaps cannot jump straight to 5-8.
+						if (age_ms >= 25) age_target = std::min<u32>(s->jitter_max_target, 4);
+						else if (age_ms >= 18) age_target = std::min<u32>(s->jitter_max_target, 3);
+						else if (age_ms >= 12) age_target = std::min<u32>(s->jitter_max_target, 2);
+						else if (age_ms >= 8) age_target = std::min<u32>(s->jitter_max_target, 2);
 
 						const size_t ahead_depth = jb.packets.size();
 						u32 depth_target = s->jitter_min_target;
-						if (ahead_depth >= 8)
-							depth_target = s->jitter_max_target;
-						else if (ahead_depth >= 4)
-							depth_target = std::min<u32>(s->jitter_max_target, 5);
-						else if (ahead_depth >= 2)
-							depth_target = std::min<u32>(s->jitter_max_target, 3);
-						else if (ahead_depth >= 1)
-							depth_target = std::min<u32>(s->jitter_max_target, 2);
+						if (ahead_depth >= 8) depth_target = std::min<u32>(s->jitter_max_target, 4);
+						else if (ahead_depth >= 4) depth_target = std::min<u32>(s->jitter_max_target, 3);
+						else if (ahead_depth >= 2) depth_target = std::min<u32>(s->jitter_max_target, 2);
+						else if (ahead_depth >= 1) depth_target = std::min<u32>(s->jitter_max_target, 1);
 
-						u32 desired_target = (age_target > depth_target) ? age_target : depth_target;
+						u32 desired_target = std::max(age_target, depth_target);
 						desired_target = std::clamp(desired_target, s->jitter_min_target, s->jitter_max_target);
 						if (desired_target > jb.target_packets)
 						{
@@ -632,12 +658,9 @@ namespace usb_uepcb
 							jb.last_target_change = now;
 							jb.last_target_change_valid = true;
 							++jb.diag_fast_attack;
-							if (jb.target_packets > jb.diag_peak_target)
-								jb.diag_peak_target = jb.target_packets;
-							Console.WriteLn(
-								"UePcb 1.6 Fast Attack: target buffer -> %u (peer key %llu, gap=%lldms, ahead=%zu)",
-								jb.target_packets, static_cast<unsigned long long>(entry.first),
-								static_cast<long long>(age_ms), ahead_depth);
+							if (jb.target_packets > jb.diag_peak_target) jb.diag_peak_target = jb.target_packets;
+							Console.WriteLn("UePcb 1.7.2B Fast Attack: target -> %u (peer %llu, gap=%lldms, ahead=%zu)",
+								jb.target_packets, static_cast<unsigned long long>(entry.first), age_ms, ahead_depth);
 						}
 					}
 
@@ -977,7 +1000,7 @@ namespace usb_uepcb
 			host_peers.push_back(ep);
 			char ipbuf[INET_ADDRSTRLEN] = {};
 			if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
-				Console.WriteLn("UePcb 1.7.1B: discovered Client UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(rp.udp_port));
+				Console.WriteLn("UePcb 1.7.2B: discovered Client UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(rp.udp_port));
 		}
 		auto_set_udp_peers(s, host_peers);
 
@@ -1046,7 +1069,7 @@ namespace usb_uepcb
 			}
 		}
 
-		Console.WriteLn("UePcb 1.7.1B: TCP bootstrap peer list generation %u sent (%d client%s, UDP local %d)",
+		Console.WriteLn("UePcb 1.7.2B: TCP bootstrap peer list generation %u sent (%d client%s, UDP local %d)",
 			generation, static_cast<int>(ready.size()), ready.size() == 1 ? "" : "s", s->udp_port);
 	}
 
@@ -1078,7 +1101,7 @@ namespace usb_uepcb
 		for (socket_t p : ready_sockets)
 			auto_send_activate(s, p, generation);
 		s->auto_udp_ready = true;
-		Console.WriteLn("UePcb 1.7.1B: Auto UDP P2P ACTIVE generation %u (%d peer%s)",
+		Console.WriteLn("UePcb 1.7.2B: Auto UDP P2P ACTIVE generation %u (%d peer%s)",
 			generation, static_cast<int>(ready_sockets.size()), ready_sockets.size() == 1 ? "" : "s");
 	}
 
@@ -1108,12 +1131,12 @@ namespace usb_uepcb
 				peers.push_back(ep);
 				char ipbuf[INET_ADDRSTRLEN] = {};
 				if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
-					Console.WriteLn("UePcb 1.7.1B: peer-list UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(ntohs(ep.sin_port)));
+					Console.WriteLn("UePcb 1.7.2B: peer-list UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(ntohs(ep.sin_port)));
 			}
 		}
 		auto_set_udp_peers(s, peers);
 		auto_send_ack(s, conn, generation);
-		Console.WriteLn("UePcb 1.7.1B: received Auto UDP peer list generation %u (%d endpoint%s); ACK sent",
+		Console.WriteLn("UePcb 1.7.2B: received Auto UDP peer list generation %u (%d endpoint%s); ACK sent",
 			generation, static_cast<int>(peers.size()), peers.size() == 1 ? "" : "s");
 	}
 
@@ -1123,7 +1146,7 @@ namespace usb_uepcb
 			return false;
 		if (s->tcp_data_mode != 1)
 		{
-			Console.Warning("UePcb 1.7.1B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			Console.Warning("UePcb 1.7.2B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
 			return true;
 		}
 		const u8 type = data[4];
@@ -1135,7 +1158,7 @@ namespace usb_uepcb
 			if (generation == s->auto_client_generation && generation != 0)
 			{
 				s->auto_udp_ready = true;
-				Console.WriteLn("UePcb 1.7.1B: Auto UDP P2P ACTIVE generation %u", generation);
+				Console.WriteLn("UePcb 1.7.2B: Auto UDP P2P ACTIVE generation %u", generation);
 			}
 		}
 		return true;
@@ -1147,7 +1170,7 @@ namespace usb_uepcb
 			return false;
 		if (s->tcp_data_mode != 1)
 		{
-			Console.Warning("UePcb 1.7.1B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			Console.Warning("UePcb 1.7.2B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
 			return true;
 		}
 
@@ -1296,7 +1319,7 @@ namespace usb_uepcb
 					if (s->tcp_data_mode == 1 && s->udp_sock != UEPCB_INVALID_SOCKET)
 					{
 						if (auto_send_hello(s, conn))
-							Console.WriteLn("UePcb 1.7.1B: Auto UDP HELLO sent (local UDP %d)", s->udp_port);
+							Console.WriteLn("UePcb 1.7.2B: Auto UDP HELLO sent (local UDP %d)", s->udp_port);
 					}
 					tcp_client_recv_loop(s, conn);
 
@@ -1402,7 +1425,7 @@ namespace usb_uepcb
 					}
 					if (!accepted)
 					{
-						Console.Warning("UePcb 1.7.1B: refusing extra TCP peer; UE PCB session supports Host + 3 Clients");
+						Console.Warning("UePcb 1.7.2B: refusing extra TCP peer; UE PCB session supports Host + 3 Clients");
 						sock_close(conn);
 					}
 				}
@@ -1856,17 +1879,19 @@ namespace usb_uepcb
 	static void load_runtime_settings(UePcbState* s, SettingsInterface& si, u32 port, bool initial)
 	{
 		s->config_port = port;
-		// 1.7.1B user-facing order is TCP first, UDP second. Keep the internal
+		// 1.7.2B user-facing order is TCP first, UDP second. Keep the internal
 		// transport semantics unchanged (0=UDP, 1=TCP) by translating here.
 		const int connection_mode_ui = std::clamp(USB::GetConfigInt(si, port, "UePcb", "ConnectionMode171", 0), 0, 1);
 		s->connection_mode = (connection_mode_ui == 0) ? 1 : 0;
 		s->advanced_settings = USB::GetConfigBool(si, port, "UePcb", "AdvancedSettings", false);
+		s->fast_attack_enabled = USB::GetConfigBool(si, port, "UePcb", "FastAttackEnabled", true);
+		s->local_timing_protection = USB::GetConfigBool(si, port, "UePcb", "LocalTimingProtection", true);
 		s->broadcast_ip = s->advanced_settings ?
 			USB::GetConfigString(si, port, "UePcb", "TargetIP", "255.255.255.255") : "255.255.255.255";
 		s->udp_port = USB::GetConfigInt(si, port, "UePcb", "Port", 7500);
 		s->tcp_port = s->udp_port;
 		s->tcp_is_host = (USB::GetConfigInt(si, port, "UePcb", "TCPRole", 0) == 0);
-		// 1.7.1B user-facing order is Auto UDP P2P first, Stay TCP second. Internal
+		// 1.7.2B user-facing order is Auto UDP P2P first, Stay TCP second. Internal
 		// semantics remain 0=Stay TCP, 1=Auto UDP P2P.
 		const int tcp_data_mode_ui = std::clamp(USB::GetConfigInt(si, port, "UePcb", "TCPDataMode171", 0), 0, 1);
 		s->tcp_data_mode = (tcp_data_mode_ui == 0) ? 1 : 0;
@@ -1926,8 +1951,8 @@ namespace usb_uepcb
 		}
 		std::memcpy(s->an986_regs + 0x10, s->mac, 6);
 
-		Console.WriteLn("UePcb 1.7.1B settings: mode=%s port=%d TCPAfter=%s Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
-			s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
+		Console.WriteLn("UePcb 1.7.2B settings: FastAttack=%s LocalTimingProtection=%s mode=%s port=%d TCPAfter=%s Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
+			s->fast_attack_enabled ? "ON" : "OFF", s->local_timing_protection ? "ON" : "OFF", s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
 			s->tcp_data_mode == 0 ? "StayTCP" : "AutoUDP",
 			grace_ms, decay_ms, min_target, max_target, max_packets,
 			s->beta_sync_hold ? "ON" : "OFF", sync_hold_ms,
@@ -2038,7 +2063,7 @@ namespace usb_uepcb
 				s->udp_sock = sock;
 				s->udp_port = candidate;
 				if (auto_allocate)
-					Console.WriteLn("UePcb 1.7.1B: Auto UDP local port allocated: %d", candidate);
+					Console.WriteLn("UePcb 1.7.2B: Auto UDP local port allocated: %d", candidate);
 				return true;
 			}
 
@@ -2073,7 +2098,7 @@ namespace usb_uepcb
 			if (open_udp_socket(s, true))
 				s->udp_recv_thread = std::thread(udp_recv_loop, s);
 			else
-				Console.Warning("UePcb 1.7.1B: Auto UDP unavailable; session will remain on TCP");
+				Console.Warning("UePcb 1.7.2B: Auto UDP unavailable; session will remain on TCP");
 		}
 
 		Console.WriteLn("UePcb: TCP mode role=%s session-port=%d after-connect=%s %s=%s",
@@ -2157,7 +2182,7 @@ namespace usb_uepcb
 	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		Console.WriteLn("UePcb 1.7.1B: applying settings live (transport restart only; game stays running)");
+		Console.WriteLn("UePcb 1.7.2B: applying settings live (transport restart only; game stays running)");
 
 		// Stop socket/thread activity before changing strings, ports or mode.
 		// tx_seq deliberately survives so remote peers do not see our UDP
@@ -2166,12 +2191,12 @@ namespace usb_uepcb
 		clear_transport_queues(s);
 		load_runtime_settings(s, si, s->config_port, false);
 		if (!start_transport(s))
-			Console.Error("UePcb 1.7.1B: live Apply completed, but transport restart failed");
+			Console.Error("UePcb 1.7.2B: live Apply completed, but transport restart failed");
 		else
-			Console.WriteLn("UePcb 1.7.1B: live Apply complete");
+			Console.WriteLn("UePcb 1.7.2B: live Apply complete");
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7.1B"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7.2B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -2213,7 +2238,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::IntegerList, .name = "TCPRole", .display_name = "TCP Role",
 				.description = "Host listens and relays frames to all Clients. Client connects to the Host.", .default_value = "0", .min_value = "0", .options = tcp_roles},
 			{.type = SettingInfo::Type::IntegerList, .name = "TCPDataMode171", .display_name = "After Connect",
-				.description = "Auto UDP P2P is the recommended default: TCP exchanges endpoints and then activates a direct UDP mesh. 1.7.1B also translates same-PC loopback peers to a Host address reachable by remote Clients. Stay TCP remains available as the second option. Direct Internet NAT hole punching is not included.",
+				.description = "Auto UDP P2P is the recommended default: TCP exchanges endpoints and then activates a direct UDP mesh. 1.7.2B also translates same-PC loopback peers to a Host address reachable by remote Clients. Stay TCP remains available as the second option. Direct Internet NAT hole punching is not included.",
 				.default_value = "0", .min_value = "0", .options = tcp_data_modes},
 			{.type = SettingInfo::Type::String, .name = "TCPBindIP", .display_name = "Listen IP",
 				.description = "TCP Host only. 0.0.0.0 listens on all LAN/VPN adapters; 127.0.0.1 limits it to this PC.", .default_value = "0.0.0.0"},
@@ -2238,12 +2263,16 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::String, .name = "History9", .display_name = "Saved IP 9", .description = "Hidden history storage.", .default_value = ""},
 			{.type = SettingInfo::Type::String, .name = "History10", .display_name = "Saved IP 10", .description = "Hidden history storage.", .default_value = ""},
 
+			{.type = SettingInfo::Type::Boolean, .name = "FastAttackEnabled", .display_name = "Fast Attack",
+				.description = "UDP only. Enables adaptive target-buffer increases after a persistent sequence gap. Default ON; can be disabled independently of Sync Hold.", .default_value = "true"},
+			{.type = SettingInfo::Type::Boolean, .name = "LocalTimingProtection", .display_name = "Local Timing Protection",
+				.description = "UDP only. Default ON. Suppresses Fast Attack for a poll cycle when multiple peer streams show sequence gaps within 30 ms, a heuristic for shared emulator/USB scheduling stalls.", .default_value = "true"},
 			{.type = SettingInfo::Type::Boolean, .name = "AdvancedSettings", .display_name = "Advanced Settings",
 				.description = "Normal play can leave this OFF. UE PCB 1.6 then forces the tested UDP defaults: Grace 4 ms, Decay 250 ms, Target 1-8, Queue 8, and Sync Hold ON at 30 ms. Enable only to tune these values or test experimental options.", .default_value = "false"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterGraceMs", .display_name = "Jitter Grace (ms)", .description = "UDP only. Normal short reorder is ignored inside this grace window; after it, Fast Attack may raise the target before forced skip.", .default_value = "4", .min_value = "0", .max_value = "20", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterDecayMs", .display_name = "Buffer Decay (ms)", .description = "UDP only. Stable time before target buffer relaxes by one. 250 ms gives roughly 1.75 s for 8 -> 1.", .default_value = "250", .min_value = "250", .max_value = "60000", .step_value = "250"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMinTarget", .display_name = "Minimum Target Buffer", .description = "UDP only. Default 1.", .default_value = "1", .min_value = "1", .max_value = "8", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 8 for 1.6 Fast Attack.", .default_value = "8", .min_value = "1", .max_value = "8", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 8. Fast Attack now uses gentler adaptive steps in 1.7.2B.", .default_value = "8", .min_value = "1", .max_value = "8", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMaxPackets", .display_name = "Maximum Jitter Queue", .description = "UDP only. Default 8; keep small to avoid latency buildup.", .default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
 
 			// 1.6 advanced synchronization controls. Sync Hold is recommended ON; experimental controls default OFF.
