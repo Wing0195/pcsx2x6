@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb 1.7.2B (Beta)
+// usb-uepcb 1.7.2B Fix (Beta build fix)
 // Created by Wing0195
 // Based on: UE PCB 1.6 release
 //
-// 1.7.2B beta:
+// 1.7.2B beta features (preserved in Fix):
 //   - Adds independent Fast Attack ON/OFF control (default ON).
 //   - Adds Local Timing Protection (default ON): if multiple peer streams develop
 //     sequence gaps within a 30 ms window, suppresses Fast Attack for that poll
@@ -37,12 +37,16 @@
 //   - Adds Advanced Settings gate for UDP jitter tuning.
 //   - Keeps shared Saved IP history for UDP peers and TCP Host IP.
 //
-// Earlier history (from the project's known notes):
+// UEPCB version history (Wing0195's retrospective):
 //   - 1.0: original UE PCB implementation.
 //   - 1.1: Gundam NEXT compatibility/fix release.
-//   - 1.2: exact change notes are not available in the recovered source history;
-//     intentionally not guessed here.
-//   - 1.3: adaptive per-peer jitter buffer and diagnostic groundwork (1.3.x).
+//   - 1.2: NOT a formal, consistent release. This was an exploratory improvement
+//     period with experiments and edits across multiple AI-assisted variants; version
+//     naming was inconsistent and some builds were faulty. It marks the start of
+//     improvement work, but should not be treated as one stable 1.2 baseline.
+//   - Claude 1.3: first coherent design direction. Per-peer adaptive jitter buffering,
+//     growth only after a genuine unresolved gap, time-based recovery, and diagnostics
+//     became the foundation for subsequent versions.
 //
 // 1.4 changes:
 //   - Polished compact two-column UEPCB settings UI (paired ControllerBindingWidget file).
@@ -54,19 +58,18 @@
 //   - Grace/Decay/MinTarget/MaxTarget/MaxQueue are user-adjustable settings.
 //   - Defaults reproduce Claude 1.3/1.3.1 synchronization timing.
 //   - Recovered diagnostic now counts ahead-arriving packets later promoted in order.
-// Based on: usb-uepcb_fixed_udp_1_2_dynamic_buildfix.cpp
+// Technical lineage: an early experimental 1.2-era dynamic-jitter prototype was
+// among the inputs reviewed while shaping 1.3. Version 1.2 was not a formal release
+// and its variants were inconsistent; this note describes the specific behavior in
+// that prototype, not a claim that all 1.2-era files shared the same implementation.
 //
-// Change from 1.2: the adaptive jitter buffer's grow/decay logic was
-// asymmetric in a way that real-world Wi-Fi test logs showed pins
-// target_packets at its maximum within the first ~10-40 seconds of a
-// match and keeps it there for 93-98% of the session, even on a run
-// where one side was on wired Ethernet. Root cause: jitter_insert() bumped
-// target_packets the instant ANY packet arrived out of the expected order
-// - including harmless, self-resolving 1-packet swaps, which measured
-// logs showed recurring every ~4-5 seconds on average - while recovery
-// required 120 consecutive perfectly-ordered deliveries (~6-7s at the
-// observed packet rate), a bar that was reset to zero by the very same
-// harmless events and so was essentially never reached.
+// In that prototype, real-world Wi-Fi test logs showed target_packets reaching its
+// maximum within ~10-40 seconds and staying there for 93-98% of a session, even when
+// one side used wired Ethernet. The observed cause was that jitter_insert() raised
+// target_packets as soon as ANY packet arrived out of order, including harmless,
+// self-resolving one-packet swaps; recovery required 120 consecutive perfectly
+// ordered deliveries (~6-7s at the observed packet rate), and those same harmless
+// reorderings reset the counter.
 //
 // Fix in 1.3:
 //   1) target_packets now only grows in jitter_promote(), at the moment a
@@ -488,10 +491,11 @@ namespace usb_uepcb
 		// anymore. A packet simply arriving out of order (seq != jb.next_seq)
 		// is the ordinary case of two adjacent UDP datagrams swapping order
 		// by a couple of milliseconds - real Wi-Fi links do this constantly,
-		// and it self-resolves almost immediately. In 1.2 this bumped the
-		// buffer target on every such event, which measured test logs showed
-		// pinned target_packets at its max within the first ~10-40 seconds
-		// of every match and kept it there almost the whole game. Growing
+		// and it self-resolves almost immediately. In some early pre-1.3
+		// experimental variants from the informal 1.2-era work, this bumped
+		// the buffer target on every such event. Test logs showed target_packets
+		// pinned at its max within ~10-40 seconds and staying there almost the
+		// whole game. Growing
 		// the buffer only happens in jitter_promote() now, at the point a
 		// gap's grace period genuinely expires - i.e. only when growing the
 		// buffer would actually have helped. gap_active/gap_since are also
@@ -625,8 +629,13 @@ namespace usb_uepcb
 						{
 							if (other.first == entry.first || !other.second.gap_active)
 								continue;
-							const auto other_gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - other.second.gap_since);
-							if (other_gap.count() >= 0 && other_gap <= std::chrono::milliseconds(30))
+							// Compare start times: both gaps must have begun within 30 ms.
+							// Checking only the age of the other gap could suppress Fast Attack
+							// even when the two gaps started far apart.
+							const auto gap_separation = (other.second.gap_since >= jb.gap_since)
+								? (other.second.gap_since - jb.gap_since)
+								: (jb.gap_since - other.second.gap_since);
+							if (gap_separation <= std::chrono::milliseconds(30))
 								++active_gaps;
 						}
 						simultaneous_peer_gaps = (active_gaps > 0);
@@ -650,7 +659,7 @@ namespace usb_uepcb
 						else if (ahead_depth >= 2) depth_target = std::min<u32>(s->jitter_max_target, 2);
 						else if (ahead_depth >= 1) depth_target = std::min<u32>(s->jitter_max_target, 1);
 
-						u32 desired_target = std::max(age_target, depth_target);
+						u32 desired_target = (std::max)(age_target, depth_target); // Avoid Windows max macro expansion (MSVC C2589).
 						desired_target = std::clamp(desired_target, s->jitter_min_target, s->jitter_max_target);
 						if (desired_target > jb.target_packets)
 						{
@@ -2182,7 +2191,7 @@ namespace usb_uepcb
 	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		Console.WriteLn("UePcb 1.7.2B: applying settings live (transport restart only; game stays running)");
+		Console.WriteLn("UePcb 1.7.2B Fix: applying settings live (transport restart only; game stays running)");
 
 		// Stop socket/thread activity before changing strings, ports or mode.
 		// tx_seq deliberately survives so remote peers do not see our UDP
@@ -2191,12 +2200,12 @@ namespace usb_uepcb
 		clear_transport_queues(s);
 		load_runtime_settings(s, si, s->config_port, false);
 		if (!start_transport(s))
-			Console.Error("UePcb 1.7.2B: live Apply completed, but transport restart failed");
+			Console.Error("UePcb 1.7.2B Fix: live Apply completed, but transport restart failed");
 		else
-			Console.WriteLn("UePcb 1.7.2B: live Apply complete");
+			Console.WriteLn("UePcb 1.7.2B Fix: live Apply complete");
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7.2B"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7.2B Fix"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
