@@ -1,11 +1,23 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 //
-// usb-uepcb 1.7.2B Fix (Beta build fix)
+// usb-uepcb 1.7.3B (Host-authoritative session settings)
 // Created by Wing0195
 // Based on: UE PCB 1.6 release
 //
-// 1.7.2B beta features (preserved in Fix):
+// 1.7.3B changes (based on the user-tested 1.7.2B Fix):
+//   - TCP Host sends a versioned session-settings payload to each Client.
+//   - Payload includes a session ID and FNV-1a hash; Client validates bounds/hash,
+//     applies only to runtime fields, and returns an explicit ACK/status.
+//   - Host only counts a Client as settings-ready after matching version/session/hash ACK.
+//   - Client permanent settings are never written by this exchange. Runtime overrides
+//     are restored on disconnect/reconnect or before a local Apply reloads settings.
+//   - Local MAC, TCP/UDP ports, Host IP, bind IP, peer endpoints and transport role/mode
+//     are deliberately excluded from Host-authoritative settings.
+//   - Version/hash/apply/ACK failures are logged; Auto UDP P2P cannot activate for a
+//     Client that has not confirmed the Host settings.
+//
+// 1.7.2B Fix features (preserved):
 //   - Adds independent Fast Attack ON/OFF control (default ON).
 //   - Adds Local Timing Protection (default ON): if multiple peer streams develop
 //     sequence gaps within a 30 ms window, suppresses Fast Attack for that poll
@@ -273,6 +285,27 @@ namespace usb_uepcb
 		bool fast_attack_enabled = true;
 		bool local_timing_protection = true;
 
+		// 1.7.3B: Host settings are a session-only runtime overlay. Never save them
+		// back through SettingsInterface; restore these values when the TCP session ends.
+		struct SessionSettingsBackup
+		{
+			bool valid = false;
+			bool fast_attack_enabled = true;
+			bool local_timing_protection = true;
+			std::chrono::milliseconds jitter_grace{4};
+			std::chrono::milliseconds jitter_decay_interval{250};
+			u32 jitter_min_target = 1;
+			u32 jitter_max_target = 8;
+			size_t jitter_max_packets = 8;
+			bool beta_sync_hold = true;
+			std::chrono::milliseconds beta_sync_hold_time{30};
+			bool beta_adaptive_playout = false;
+			std::chrono::milliseconds beta_playout_max{3};
+			bool beta_global_stall_guard = false;
+		} session_settings_backup;
+		std::atomic<bool> host_settings_applied{false};
+		u32 host_config_session_id = 0;
+
 		// Transport selection: 0 = UDP, 1 = TCP.
 		int connection_mode = 0;
 		bool advanced_settings = false;
@@ -304,6 +337,12 @@ namespace usb_uepcb
 			u16 udp_port = 0;
 			std::array<u8, 6> mac{};
 			u32 ack_generation = 0;
+			bool settings_acked = false;
+			u16 settings_version = 0;
+			u32 settings_session_id = 0;
+			u32 settings_hash = 0;
+			std::chrono::steady_clock::time_point settings_sent_at{};
+			bool settings_timeout_logged = false;
 		};
 
 		std::mutex tcp_peers_lock;
@@ -668,7 +707,7 @@ namespace usb_uepcb
 							jb.last_target_change_valid = true;
 							++jb.diag_fast_attack;
 							if (jb.target_packets > jb.diag_peak_target) jb.diag_peak_target = jb.target_packets;
-							Console.WriteLn("UePcb 1.7.2B Fast Attack: target -> %u (peer %llu, gap=%lldms, ahead=%zu)",
+							Console.WriteLn("UePcb 1.7.3B Fast Attack: target -> %u (peer %llu, gap=%lldms, ahead=%zu)",
 								jb.target_packets, static_cast<unsigned long long>(entry.first), age_ms, ahead_depth);
 						}
 					}
@@ -867,7 +906,10 @@ namespace usb_uepcb
 		AUTO_CTRL_PEER_LIST = 2,
 		AUTO_CTRL_ACK = 3,
 		AUTO_CTRL_ACTIVATE = 4,
+		AUTO_CTRL_SETTINGS = 5,
+		AUTO_CTRL_SETTINGS_ACK = 6,
 	};
+	static constexpr u16 kHostSettingsSchemaVersion = 1;
 
 	static bool tcp_send_payload(socket_t c, const u8* data, int len)
 	{
@@ -907,6 +949,208 @@ namespace usb_uepcb
 	{
 		return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
 			(static_cast<u32>(p[2]) << 8) | static_cast<u32>(p[3]);
+	}
+
+	static u32 auto_settings_hash(const u8* data, size_t len)
+	{
+		// FNV-1a 32-bit hash: compact mismatch detection, not a security primitive.
+		u32 hash = 2166136261u;
+		for (size_t i = 0; i < len; ++i)
+		{
+			hash ^= data[i];
+			hash *= 16777619u;
+		}
+		return hash;
+	}
+
+	static void auto_put_u32_at(std::vector<u8>& out, size_t offset, u32 value)
+	{
+		out[offset] = static_cast<u8>((value >> 24) & 0xff);
+		out[offset + 1] = static_cast<u8>((value >> 16) & 0xff);
+		out[offset + 2] = static_cast<u8>((value >> 8) & 0xff);
+		out[offset + 3] = static_cast<u8>(value & 0xff);
+	}
+
+	static void restore_session_runtime_settings(UePcbState* s)
+	{
+		if (!s->session_settings_backup.valid)
+			return;
+		const auto& b = s->session_settings_backup;
+		{
+			std::lock_guard<std::mutex> lk(s->jitter_lock);
+			s->fast_attack_enabled = b.fast_attack_enabled;
+			s->local_timing_protection = b.local_timing_protection;
+			s->jitter_grace = b.jitter_grace;
+			s->jitter_decay_interval = b.jitter_decay_interval;
+			s->jitter_min_target = b.jitter_min_target;
+			s->jitter_max_target = b.jitter_max_target;
+			s->jitter_max_packets = b.jitter_max_packets;
+			s->beta_sync_hold = b.beta_sync_hold;
+			s->beta_sync_hold_time = b.beta_sync_hold_time;
+			s->beta_adaptive_playout = b.beta_adaptive_playout;
+			s->beta_playout_max = b.beta_playout_max;
+			s->beta_global_stall_guard = b.beta_global_stall_guard;
+			for (auto& entry : s->peer_jitter)
+				entry.second.target_packets = std::clamp(entry.second.target_packets, s->jitter_min_target, s->jitter_max_target);
+		}
+		s->session_settings_backup.valid = false;
+		s->host_settings_applied = false;
+		Console.WriteLn("UePcb 1.7.3B: restored Client's local runtime settings after Host session; permanent config was not modified");
+	}
+
+	static void apply_host_session_settings(UePcbState* s, const u8* body)
+	{
+		if (!s->session_settings_backup.valid)
+		{
+			std::lock_guard<std::mutex> lk(s->jitter_lock);
+			auto& b = s->session_settings_backup;
+			b.fast_attack_enabled = s->fast_attack_enabled;
+			b.local_timing_protection = s->local_timing_protection;
+			b.jitter_grace = s->jitter_grace;
+			b.jitter_decay_interval = s->jitter_decay_interval;
+			b.jitter_min_target = s->jitter_min_target;
+			b.jitter_max_target = s->jitter_max_target;
+			b.jitter_max_packets = s->jitter_max_packets;
+			b.beta_sync_hold = s->beta_sync_hold;
+			b.beta_sync_hold_time = s->beta_sync_hold_time;
+			b.beta_adaptive_playout = s->beta_adaptive_playout;
+			b.beta_playout_max = s->beta_playout_max;
+			b.beta_global_stall_guard = s->beta_global_stall_guard;
+			b.valid = true;
+		}
+		{
+			std::lock_guard<std::mutex> lk(s->jitter_lock);
+			s->fast_attack_enabled = body[0] != 0;
+			s->local_timing_protection = body[1] != 0;
+			s->jitter_grace = std::chrono::milliseconds(auto_get_u16(body + 2));
+			s->jitter_decay_interval = std::chrono::milliseconds(auto_get_u32(body + 4));
+			s->jitter_min_target = body[8];
+			s->jitter_max_target = body[9];
+			s->jitter_max_packets = body[10];
+			s->beta_sync_hold = body[11] != 0;
+			s->beta_sync_hold_time = std::chrono::milliseconds(auto_get_u16(body + 12));
+			s->beta_adaptive_playout = body[14] != 0;
+			s->beta_playout_max = std::chrono::milliseconds(auto_get_u16(body + 15));
+			s->beta_global_stall_guard = body[17] != 0;
+			for (auto& entry : s->peer_jitter)
+				entry.second.target_packets = std::clamp(entry.second.target_packets, s->jitter_min_target, s->jitter_max_target);
+		}
+		s->host_settings_applied = true;
+		Console.WriteLn("UePcb 1.7.3B: Host settings applied to this session only (FastAttack=%s LocalTiming=%s Grace=%dms Decay=%dms Target=%u-%u Queue=%zu SyncHold=%s(%dms) Playout=%s(max %dms) StallGuard=%s)",
+			s->fast_attack_enabled ? "ON" : "OFF", s->local_timing_protection ? "ON" : "OFF",
+			static_cast<int>(s->jitter_grace.count()), static_cast<int>(s->jitter_decay_interval.count()),
+			s->jitter_min_target, s->jitter_max_target, s->jitter_max_packets,
+			s->beta_sync_hold ? "ON" : "OFF", static_cast<int>(s->beta_sync_hold_time.count()),
+			s->beta_adaptive_playout ? "ON" : "OFF", static_cast<int>(s->beta_playout_max.count()),
+			s->beta_global_stall_guard ? "ON" : "OFF");
+	}
+
+	static bool auto_send_host_settings(UePcbState* s, socket_t conn)
+	{
+		if (s->host_config_session_id == 0)
+		{
+			s->host_config_session_id = static_cast<u32>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+				(static_cast<u32>(s->tcp_port) << 16) ^ static_cast<u32>(s->udp_port);
+			if (s->host_config_session_id == 0) s->host_config_session_id = 1;
+		}
+		std::vector<u8> msg;
+		msg.reserve(34);
+		msg.insert(msg.end(), kAutoCtrlMagic, kAutoCtrlMagic + 4);
+		msg.push_back(AUTO_CTRL_SETTINGS);
+		msg.push_back(kAutoCtrlVersion);
+		auto_put_u16(msg, kHostSettingsSchemaVersion);
+		auto_put_u32(msg, s->host_config_session_id);
+		auto_put_u32(msg, 0); // hash placeholder, filled after the settings body is serialized.
+		msg.push_back(s->fast_attack_enabled ? 1 : 0);
+		msg.push_back(s->local_timing_protection ? 1 : 0);
+		const auto clamp_u16 = [](long long v) { return static_cast<u16>(std::clamp<long long>(v, 0, 65535)); };
+		auto_put_u16(msg, clamp_u16(s->jitter_grace.count()));
+		auto_put_u32(msg, static_cast<u32>(std::clamp<long long>(s->jitter_decay_interval.count(), 0, 60000)));
+		msg.push_back(static_cast<u8>(std::clamp<u32>(s->jitter_min_target, 1, 8)));
+		msg.push_back(static_cast<u8>(std::clamp<u32>(s->jitter_max_target, 1, 8)));
+		msg.push_back(static_cast<u8>(std::clamp<size_t>(s->jitter_max_packets, 1, 32)));
+		msg.push_back(s->beta_sync_hold ? 1 : 0);
+		auto_put_u16(msg, clamp_u16(s->beta_sync_hold_time.count()));
+		msg.push_back(s->beta_adaptive_playout ? 1 : 0);
+		auto_put_u16(msg, clamp_u16(s->beta_playout_max.count()));
+		msg.push_back(s->beta_global_stall_guard ? 1 : 0);
+		const u32 hash = auto_settings_hash(msg.data() + 16, msg.size() - 16);
+		auto_put_u32_at(msg, 12, hash);
+		bool sent = false;
+		{
+			std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+			auto it = s->tcp_peer_meta.find(conn);
+			if (it != s->tcp_peer_meta.end())
+			{
+				it->second.settings_acked = false;
+				it->second.settings_version = kHostSettingsSchemaVersion;
+				it->second.settings_session_id = s->host_config_session_id;
+				it->second.settings_hash = hash;
+				it->second.settings_sent_at = std::chrono::steady_clock::now();
+				it->second.settings_timeout_logged = false;
+			}
+			sent = tcp_send_payload(conn, msg.data(), static_cast<int>(msg.size()));
+		}
+		if (sent)
+			Console.WriteLn("UePcb 1.7.3B: Host settings sent schema=%u session=%u hash=%08X (%zu bytes); waiting for Client ACK",
+				kHostSettingsSchemaVersion, s->host_config_session_id, hash, msg.size());
+		else
+			Console.Error("UePcb 1.7.3B: FAILED to send Host settings session=%u", s->host_config_session_id);
+		return sent;
+	}
+
+	static bool auto_send_settings_ack(UePcbState* s, socket_t conn, u16 schema, u32 session_id, u32 hash, u8 status)
+	{
+		std::vector<u8> msg;
+		msg.insert(msg.end(), kAutoCtrlMagic, kAutoCtrlMagic + 4);
+		msg.push_back(AUTO_CTRL_SETTINGS_ACK);
+		msg.push_back(kAutoCtrlVersion);
+		auto_put_u16(msg, schema);
+		auto_put_u32(msg, session_id);
+		auto_put_u32(msg, hash);
+		msg.push_back(status); // 0=OK, 1=unsupported schema, 2=hash mismatch, 3=invalid values
+		std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+		return tcp_send_payload(conn, msg.data(), static_cast<int>(msg.size()));
+	}
+
+	static bool auto_client_handle_host_settings(UePcbState* s, socket_t conn, const u8* data, int len)
+	{
+		if (!auto_is_control(data, len) || data[4] != AUTO_CTRL_SETTINGS)
+			return false;
+		if (len != 34)
+		{
+			Console.Error("UePcb 1.7.3B: Host settings rejected: invalid payload length %d (expected 34)", len);
+			return true;
+		}
+		const u16 schema = auto_get_u16(data + 6);
+		const u32 session_id = auto_get_u32(data + 8);
+		const u32 received_hash = auto_get_u32(data + 12);
+		const u32 calculated_hash = auto_settings_hash(data + 16, static_cast<size_t>(len - 16));
+		u8 status = 0;
+		if (schema != kHostSettingsSchemaVersion) status = 1;
+		else if (received_hash != calculated_hash) status = 2;
+		const u8* b = data + 16;
+		const u16 grace = auto_get_u16(b + 2);
+		const u32 decay = auto_get_u32(b + 4);
+		const u16 hold = auto_get_u16(b + 12);
+		const u16 playout = auto_get_u16(b + 15);
+		if (status == 0 && (b[0] > 1 || b[1] > 1 || grace > 20 || decay < 250 || decay > 60000 ||
+			b[8] < 1 || b[8] > 8 || b[9] < b[8] || b[9] > 8 || b[10] < b[9] || b[10] > 32 ||
+			b[11] > 1 || hold < 3 || hold > 100 || b[14] > 1 || playout > 20 || b[17] > 1)) status = 3;
+		if (status == 0)
+		{
+			apply_host_session_settings(s, b);
+			Console.WriteLn("UePcb 1.7.3B: Host settings validation OK schema=%u session=%u hash=%08X", schema, session_id, received_hash);
+		}
+		else
+			Console.Error("UePcb 1.7.3B: Host settings rejected schema=%u session=%u receivedHash=%08X calculatedHash=%08X status=%u; local settings retained",
+				schema, session_id, received_hash, calculated_hash, status);
+		if (!auto_send_settings_ack(s, conn, schema, session_id, received_hash, status))
+			Console.Error("UePcb 1.7.3B: FAILED to send Host-settings ACK session=%u status=%u", session_id, status);
+		else
+			Console.WriteLn("UePcb 1.7.3B: Client settings ACK sent schema=%u session=%u hash=%08X status=%u (%s)",
+				schema, session_id, received_hash, status, status == 0 ? "OK" : "REJECTED");
+		return true;
 	}
 
 	static void auto_clear_udp_peers(UePcbState* s)
@@ -988,7 +1232,7 @@ namespace usb_uepcb
 			for (socket_t p : s->tcp_peers)
 			{
 				auto it = s->tcp_peer_meta.find(p);
-				if (it == s->tcp_peer_meta.end() || !it->second.hello_received)
+				if (it == s->tcp_peer_meta.end() || !it->second.hello_received || !it->second.settings_acked)
 					continue;
 				it->second.ack_generation = 0;
 				ReadyPeer rp;
@@ -1009,7 +1253,7 @@ namespace usb_uepcb
 			host_peers.push_back(ep);
 			char ipbuf[INET_ADDRSTRLEN] = {};
 			if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
-				Console.WriteLn("UePcb 1.7.2B: discovered Client UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(rp.udp_port));
+				Console.WriteLn("UePcb 1.7.3B: discovered Client UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(rp.udp_port));
 		}
 		auto_set_udp_peers(s, host_peers);
 
@@ -1078,7 +1322,7 @@ namespace usb_uepcb
 			}
 		}
 
-		Console.WriteLn("UePcb 1.7.2B: TCP bootstrap peer list generation %u sent (%d client%s, UDP local %d)",
+		Console.WriteLn("UePcb 1.7.3B: TCP bootstrap peer list generation %u sent (%d client%s, UDP local %d)",
 			generation, static_cast<int>(ready.size()), ready.size() == 1 ? "" : "s", s->udp_port);
 	}
 
@@ -1096,7 +1340,7 @@ namespace usb_uepcb
 				// Do not activate a partial UDP mesh. If any connected Client is
 				// running Stay TCP, has no UDP socket, or has not completed HELLO,
 				// the whole session safely remains on TCP.
-				if (it == s->tcp_peer_meta.end() || !it->second.hello_received)
+				if (it == s->tcp_peer_meta.end() || !it->second.hello_received || !it->second.settings_acked)
 					return;
 				have_peer = true;
 				if (it->second.ack_generation != generation)
@@ -1110,7 +1354,7 @@ namespace usb_uepcb
 		for (socket_t p : ready_sockets)
 			auto_send_activate(s, p, generation);
 		s->auto_udp_ready = true;
-		Console.WriteLn("UePcb 1.7.2B: Auto UDP P2P ACTIVE generation %u (%d peer%s)",
+		Console.WriteLn("UePcb 1.7.3B: Auto UDP P2P ACTIVE generation %u (%d peer%s)",
 			generation, static_cast<int>(ready_sockets.size()), ready_sockets.size() == 1 ? "" : "s");
 	}
 
@@ -1140,12 +1384,12 @@ namespace usb_uepcb
 				peers.push_back(ep);
 				char ipbuf[INET_ADDRSTRLEN] = {};
 				if (inet_ntop(AF_INET, &ep.sin_addr, ipbuf, sizeof(ipbuf)))
-					Console.WriteLn("UePcb 1.7.2B: peer-list UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(ntohs(ep.sin_port)));
+					Console.WriteLn("UePcb 1.7.3B: peer-list UDP endpoint %s:%u", ipbuf, static_cast<unsigned>(ntohs(ep.sin_port)));
 			}
 		}
 		auto_set_udp_peers(s, peers);
 		auto_send_ack(s, conn, generation);
-		Console.WriteLn("UePcb 1.7.2B: received Auto UDP peer list generation %u (%d endpoint%s); ACK sent",
+		Console.WriteLn("UePcb 1.7.3B: received Auto UDP peer list generation %u (%d endpoint%s); ACK sent",
 			generation, static_cast<int>(peers.size()), peers.size() == 1 ? "" : "s");
 	}
 
@@ -1153,9 +1397,11 @@ namespace usb_uepcb
 	{
 		if (!auto_is_control(data, len))
 			return false;
+		if (data[4] == AUTO_CTRL_SETTINGS)
+			return auto_client_handle_host_settings(s, conn, data, len);
 		if (s->tcp_data_mode != 1)
 		{
-			Console.Warning("UePcb 1.7.2B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			Console.Warning("UePcb 1.7.3B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
 			return true;
 		}
 		const u8 type = data[4];
@@ -1167,7 +1413,7 @@ namespace usb_uepcb
 			if (generation == s->auto_client_generation && generation != 0)
 			{
 				s->auto_udp_ready = true;
-				Console.WriteLn("UePcb 1.7.2B: Auto UDP P2P ACTIVE generation %u", generation);
+				Console.WriteLn("UePcb 1.7.3B: Auto UDP P2P ACTIVE generation %u", generation);
 			}
 		}
 		return true;
@@ -1177,13 +1423,37 @@ namespace usb_uepcb
 	{
 		if (!auto_is_control(data, len))
 			return false;
-		if (s->tcp_data_mode != 1)
+		const u8 type = data[4];
+		if (type == AUTO_CTRL_SETTINGS_ACK && len == 17)
 		{
-			Console.Warning("UePcb 1.7.2B: Auto UDP control received while After Connect is Stay TCP; ignoring control packet");
+			const u16 schema = auto_get_u16(data + 6);
+			const u32 session_id = auto_get_u32(data + 8);
+			const u32 hash = auto_get_u32(data + 12);
+			const u8 status = data[16];
+			bool accepted = false;
+			{
+				std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+				auto it = s->tcp_peer_meta.find(conn);
+				if (it != s->tcp_peer_meta.end() && schema == it->second.settings_version &&
+					session_id == it->second.settings_session_id && hash == it->second.settings_hash && status == 0)
+				{
+					it->second.settings_acked = true;
+					accepted = true;
+				}
+				else if (it != s->tcp_peer_meta.end())
+					it->second.settings_acked = false;
+			}
+			if (accepted)
+				Console.WriteLn("UePcb 1.7.3B: Host CONFIRMED Client settings ACK schema=%u session=%u hash=%08X status=OK", schema, session_id, hash);
+			else
+				Console.Error("UePcb 1.7.3B: Host REJECTED Client settings ACK schema=%u session=%u hash=%08X status=%u (version/session/hash mismatch or Client validation failed)", schema, session_id, hash, status);
+			if (accepted && s->tcp_data_mode == 1)
+				auto_host_rebuild_session(s);
 			return true;
 		}
+		if (s->tcp_data_mode != 1)
+			return true;
 
-		const u8 type = data[4];
 		if (type == AUTO_CTRL_HELLO && len == 14)
 		{
 			const u16 udp_port = auto_get_u16(data + 6);
@@ -1328,9 +1598,10 @@ namespace usb_uepcb
 					if (s->tcp_data_mode == 1 && s->udp_sock != UEPCB_INVALID_SOCKET)
 					{
 						if (auto_send_hello(s, conn))
-							Console.WriteLn("UePcb 1.7.2B: Auto UDP HELLO sent (local UDP %d)", s->udp_port);
+							Console.WriteLn("UePcb 1.7.3B: Auto UDP HELLO sent (local UDP %d)", s->udp_port);
 					}
 					tcp_client_recv_loop(s, conn);
+					restore_session_runtime_settings(s);
 
 					bool owned = false;
 					{
@@ -1383,6 +1654,25 @@ namespace usb_uepcb
 
 		while (!s->thread_stop)
 		{
+			std::vector<std::pair<u32, u32>> settings_timeouts;
+			const auto settings_now = std::chrono::steady_clock::now();
+			{
+				std::lock_guard<std::mutex> lk(s->tcp_peers_lock);
+				for (auto& item : s->tcp_peer_meta)
+				{
+					auto& meta = item.second;
+					if (!meta.settings_acked && !meta.settings_timeout_logged &&
+						meta.settings_sent_at.time_since_epoch().count() != 0 &&
+						settings_now - meta.settings_sent_at >= std::chrono::seconds(5))
+					{
+						meta.settings_timeout_logged = true;
+						settings_timeouts.emplace_back(meta.settings_session_id, meta.settings_hash);
+					}
+				}
+			}
+			for (const auto& item : settings_timeouts)
+				Console.Error("UePcb 1.7.3B: Host settings ACK TIMEOUT after 5 seconds session=%u hash=%08X; Client is not settings-ready, Auto UDP P2P will not activate for it", item.first, item.second);
+
 			fd_set rf;
 			FD_ZERO(&rf);
 			FD_SET(ls, &rf);
@@ -1434,9 +1724,11 @@ namespace usb_uepcb
 					}
 					if (!accepted)
 					{
-						Console.Warning("UePcb 1.7.2B: refusing extra TCP peer; UE PCB session supports Host + 3 Clients");
+						Console.Warning("UePcb 1.7.3B: refusing extra TCP peer; UE PCB session supports Host + 3 Clients");
 						sock_close(conn);
 					}
+					else
+						auto_send_host_settings(s, conn);
 				}
 			}
 
@@ -1960,7 +2252,7 @@ namespace usb_uepcb
 		}
 		std::memcpy(s->an986_regs + 0x10, s->mac, 6);
 
-		Console.WriteLn("UePcb 1.7.2B settings: FastAttack=%s LocalTimingProtection=%s mode=%s port=%d TCPAfter=%s Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
+		Console.WriteLn("UePcb 1.7.3B settings: FastAttack=%s LocalTimingProtection=%s mode=%s port=%d TCPAfter=%s Grace=%dms Decay=%dms Target=%d-%d Queue=%d Hold=%s(%dms) Playout=%s(max %dms) StallGuard=%s",
 			s->fast_attack_enabled ? "ON" : "OFF", s->local_timing_protection ? "ON" : "OFF", s->connection_mode == 0 ? "UDP" : "TCP", s->udp_port,
 			s->tcp_data_mode == 0 ? "StayTCP" : "AutoUDP",
 			grace_ms, decay_ms, min_target, max_target, max_packets,
@@ -2072,7 +2364,7 @@ namespace usb_uepcb
 				s->udp_sock = sock;
 				s->udp_port = candidate;
 				if (auto_allocate)
-					Console.WriteLn("UePcb 1.7.2B: Auto UDP local port allocated: %d", candidate);
+					Console.WriteLn("UePcb 1.7.3B: Auto UDP local port allocated: %d", candidate);
 				return true;
 			}
 
@@ -2088,6 +2380,7 @@ namespace usb_uepcb
 	{
 		s->thread_stop = false;
 		s->auto_udp_ready = false;
+		s->host_config_session_id = 0;
 		auto_clear_udp_peers(s);
 
 		if (s->connection_mode == 0)
@@ -2107,7 +2400,7 @@ namespace usb_uepcb
 			if (open_udp_socket(s, true))
 				s->udp_recv_thread = std::thread(udp_recv_loop, s);
 			else
-				Console.Warning("UePcb 1.7.2B: Auto UDP unavailable; session will remain on TCP");
+				Console.Warning("UePcb 1.7.3B: Auto UDP unavailable; session will remain on TCP");
 		}
 
 		Console.WriteLn("UePcb: TCP mode role=%s session-port=%d after-connect=%s %s=%s",
@@ -2191,21 +2484,22 @@ namespace usb_uepcb
 	void UePcbDevice::UpdateSettings(USBDevice* dev, SettingsInterface& si) const
 	{
 		UePcbState* s = USB_CONTAINER_OF(dev, UePcbState, dev);
-		Console.WriteLn("UePcb 1.7.2B Fix: applying settings live (transport restart only; game stays running)");
+		Console.WriteLn("UePcb 1.7.3B: applying settings live (transport restart only; game stays running)");
 
 		// Stop socket/thread activity before changing strings, ports or mode.
 		// tx_seq deliberately survives so remote peers do not see our UDP
 		// sequence counter jump backwards after an Apply.
 		stop_transport(s);
+		restore_session_runtime_settings(s);
 		clear_transport_queues(s);
 		load_runtime_settings(s, si, s->config_port, false);
 		if (!start_transport(s))
-			Console.Error("UePcb 1.7.2B Fix: live Apply completed, but transport restart failed");
+			Console.Error("UePcb 1.7.3B: live Apply completed, but transport restart failed");
 		else
-			Console.WriteLn("UePcb 1.7.2B Fix: live Apply complete");
+			Console.WriteLn("UePcb 1.7.3B: live Apply complete");
 	}
 
-	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7.2B Fix"; }
+	const char* UePcbDevice::Name() const { return "UE PCB (Namco arcade TCP/UDP) 1.7.3B"; }
 	const char* UePcbDevice::TypeName() const { return "UePcb"; }
 	const char* UePcbDevice::IconName() const { return ""; }
 
@@ -2247,7 +2541,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::IntegerList, .name = "TCPRole", .display_name = "TCP Role",
 				.description = "Host listens and relays frames to all Clients. Client connects to the Host.", .default_value = "0", .min_value = "0", .options = tcp_roles},
 			{.type = SettingInfo::Type::IntegerList, .name = "TCPDataMode171", .display_name = "After Connect",
-				.description = "Auto UDP P2P is the recommended default: TCP exchanges endpoints and then activates a direct UDP mesh. 1.7.2B also translates same-PC loopback peers to a Host address reachable by remote Clients. Stay TCP remains available as the second option. Direct Internet NAT hole punching is not included.",
+				.description = "Auto UDP P2P is the recommended default: TCP first exchanges versioned Host session settings and confirms the Client ACK, then exchanges endpoints and activates a direct UDP mesh. 1.7.3B also translates same-PC loopback peers to a Host address reachable by remote Clients. Stay TCP remains available as the second option. Direct Internet NAT hole punching is not included.",
 				.default_value = "0", .min_value = "0", .options = tcp_data_modes},
 			{.type = SettingInfo::Type::String, .name = "TCPBindIP", .display_name = "Listen IP",
 				.description = "TCP Host only. 0.0.0.0 listens on all LAN/VPN adapters; 127.0.0.1 limits it to this PC.", .default_value = "0.0.0.0"},
@@ -2281,7 +2575,7 @@ namespace usb_uepcb
 			{.type = SettingInfo::Type::Integer, .name = "JitterGraceMs", .display_name = "Jitter Grace (ms)", .description = "UDP only. Normal short reorder is ignored inside this grace window; after it, Fast Attack may raise the target before forced skip.", .default_value = "4", .min_value = "0", .max_value = "20", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterDecayMs", .display_name = "Buffer Decay (ms)", .description = "UDP only. Stable time before target buffer relaxes by one. 250 ms gives roughly 1.75 s for 8 -> 1.", .default_value = "250", .min_value = "250", .max_value = "60000", .step_value = "250"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMinTarget", .display_name = "Minimum Target Buffer", .description = "UDP only. Default 1.", .default_value = "1", .min_value = "1", .max_value = "8", .step_value = "1"},
-			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 8. Fast Attack now uses gentler adaptive steps in 1.7.2B.", .default_value = "8", .min_value = "1", .max_value = "8", .step_value = "1"},
+			{.type = SettingInfo::Type::Integer, .name = "JitterMaxTarget", .display_name = "Maximum Target Buffer", .description = "UDP only. Default 8. Fast Attack uses gentler adaptive steps from 1.7.2B; 1.7.3B adds Host-authoritative session settings.", .default_value = "8", .min_value = "1", .max_value = "8", .step_value = "1"},
 			{.type = SettingInfo::Type::Integer, .name = "JitterMaxPackets", .display_name = "Maximum Jitter Queue", .description = "UDP only. Default 8; keep small to avoid latency buildup.", .default_value = "8", .min_value = "1", .max_value = "32", .step_value = "1"},
 
 			// 1.6 advanced synchronization controls. Sync Hold is recommended ON; experimental controls default OFF.
